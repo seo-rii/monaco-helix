@@ -7,7 +7,8 @@ import * as monaco from "monaco-editor";
 import { HelixController, createSession } from "./controller.js";
 import type { HelixBinding, HelixMode, HelixOptions, ModalUI } from "./types.js";
 
-export type { HelixBinding, HelixMode, HelixOptions } from "./types.js";
+export type { CommandInfo, CommandArguments } from "./commands.js";
+export type { ClipboardAdapter, HelixBinding, HelixMode, HelixOptions } from "./types.js";
 
 const bindings = new WeakMap<monaco.editor.IStandaloneCodeEditor, HelixBinding>();
 
@@ -182,7 +183,7 @@ export function initHelixMode(
     let next: HelixController | undefined;
     constructing++;
     try {
-      if (editor.getModel()) next = new HelixController(editor, ui, session, !!defaults.domReadOnly);
+      if (editor.getModel()) next = new HelixController(editor, ui, session, !!defaults.domReadOnly, options);
       else ui.mode("normal");
     } finally { constructing--; }
     if (disposed || generation !== current) { next?.dispose(false); return; }
@@ -200,6 +201,9 @@ export function initHelixMode(
   let lifetime: monaco.IDisposable | undefined;
   const binding: HelixBinding = {
     getMode: () => mode,
+    execute: (id, args) => controller?.execute(id, args) ?? Promise.reject(new Error("No active model")),
+    listCommands: () => controller?.listCommands() ?? [],
+    cancel: () => { cancelPrompt?.(); controller?.cancel(); },
     onDidChangeMode(listener) {
       if (!disposed) listeners.add(listener);
       return { dispose: () => { listeners.delete(listener); } };

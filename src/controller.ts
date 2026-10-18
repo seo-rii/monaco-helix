@@ -9,7 +9,9 @@ import {
   regexSelections, selectionBounds, textObject, wordSelection,
   type HelixSelection,
 } from "./selection.js";
-import type { HelixMode, ModalUI } from "./types.js";
+import { CommandDispatcher, isCancellation } from "./commands.js";
+import type { CommandArguments, CommandInfo } from "./commands.js";
+import type { HelixOptions, HelixMode, ModalUI } from "./types.js";
 
 interface InsertHistory {
   before: number;
@@ -28,6 +30,8 @@ export function createSession() {
 type Session = ReturnType<typeof createSession>;
 
 export class HelixController implements monaco.IDisposable {
+  private dispatcher: CommandDispatcher;
+  private clipboardWork: Promise<void> = Promise.resolve();
   private mode: HelixMode = "normal";
   private pending = "";
   private count = "";
@@ -54,8 +58,11 @@ export class HelixController implements monaco.IDisposable {
     private ui: ModalUI,
     private session: Session,
     private domReadOnly = false,
+    private options: HelixOptions = {},
   ) {
     this.boundModel = editor.getModel()!;
+    this.dispatcher = new CommandDispatcher(() => this.alive, () => this.readOnly);
+    this.registerCommands();
     this.insertMarks = editor.createDecorationsCollection();
     this.cursorDecorations = editor.createDecorationsCollection();
     this.subscriptions.push(
@@ -65,6 +72,7 @@ export class HelixController implements monaco.IDisposable {
         if ((event.browserEvent.defaultPrevented && event.browserEvent.key !== "Escape") || event.browserEvent.isComposing) return;
         if (!this.alive || !editor.hasTextFocus()) return;
         try {
+          if (event.browserEvent.key !== "Escape" && this.options.shouldHandleKey?.(event.browserEvent, this.mode) === false) return;
           if (!this.key(event.browserEvent)) return;
         } catch (error) { this.ui.error(error); }
         event.preventDefault();
@@ -196,9 +204,9 @@ export class HelixController implements monaco.IDisposable {
     });
     this.session.registers.set(this.register, texts);
     if (this.register === "+" || this.register === "*") {
-      const clipboard = globalThis.navigator?.clipboard;
+      const clipboard = this.options.clipboard ?? globalThis.navigator?.clipboard;
       if (!clipboard) this.ui.error(new Error("Clipboard is unavailable"));
-      else void clipboard.writeText(texts.join("\n")).catch(error => {
+      else this.clipboardWork = clipboard.writeText(texts.join("\n")).catch(error => {
         if (this.alive) this.ui.error(error);
       });
     }
@@ -233,9 +241,9 @@ export class HelixController implements monaco.IDisposable {
       const model = this.model;
       const version = model.getVersionId();
       const revision = this.revision;
-      const clipboard = globalThis.navigator?.clipboard;
+      const clipboard = this.options.clipboard ?? globalThis.navigator?.clipboard;
       if (!clipboard) { this.ui.error(new Error("Clipboard is unavailable")); return; }
-      void clipboard.readText().then(text => {
+      return clipboard.readText().then(text => {
         // Identity, selection/mode revision and version are all significant:
         // two different models may have identical text, ranges and version IDs.
         if (this.alive && this.model === model && model.getVersionId() === version && this.revision === revision) perform([text]);
@@ -313,7 +321,7 @@ export class HelixController implements monaco.IDisposable {
     // Monaco inserts its own undo boundaries for whitespace, completion and
     // the first typed character after a change. A Helix insert session is one
     // modal history step, even when it spans several native undo elements.
-    this.historyQueue = this.historyQueue.then(async () => {
+    return this.historyQueue = this.historyQueue.then(async () => {
       for (let n = 0; n < count && this.alive; n++) {
         if (this.readOnly) return;
         this.editor.pushUndoStop();
@@ -454,12 +462,65 @@ export class HelixController implements monaco.IDisposable {
     });
   }
 
+  execute(command: string, args: CommandArguments = {}, signal?: AbortSignal): Promise<void> {
+    return this.dispatcher.execute(command, { ...args, count: Math.max(1, Math.min(10000, Number(args.count) || 1)) }, signal);
+  }
+  listCommands(): CommandInfo[] { return this.dispatcher.list(); }
+  cancel(): void { this.revision++; this.dispatcher.cancel(); this.pending = this.count = ""; this.status(); }
+  private dispatch(command: string, args: CommandArguments = {}): void {
+    void this.execute(command, args).catch(error => { if (this.alive && !isCancellation(error)) this.ui.error(error); });
+  }
+  private registerCommands(): void {
+    const add = (id: string, description: string, run: (args: CommandArguments) => void | Promise<void>, mutates = false, keys: string[] = []) =>
+      this.dispatcher.register({ id, description, mutates, keys }, run);
+    for (const [id, key] of Object.entries({ move_char_left: "h", move_char_right: "l", move_visual_line_down: "j", move_visual_line_up: "k", move_next_word_start: "w", move_prev_word_start: "b", move_next_word_end: "e", move_next_long_word_start: "W", move_prev_long_word_start: "B", move_next_long_word_end: "E", goto_line_start: "Home", goto_line_end: "End" }))
+      add(id, id.replaceAll("_", " "), args => this.move(key, args.count!), false, [key]);
+    for (const [id, key] of Object.entries({ insert_mode: "i", append_mode: "a", insert_at_line_start: "I", insert_at_line_end: "A", open_below: "o", open_above: "O", change_selection: "c" }))
+      add(id, id.replaceAll("_", " "), () => this.enterInsert(key), true, [key]);
+    add("normal_mode", "Return to Normal", () => { if (this.mode === "insert") this.leaveInsert(); else this.setMode("normal"); });
+    add("select_mode", "Extend selections", () => this.setMode(this.mode === "select" ? "normal" : "select"), false, ["v"]);
+    add("delete_selection", "Delete and yank selections", () => { this.yank(); this.replace([""]); }, true, ["d"]);
+    add("yank", "Yank selections", () => { this.yank(); return this.clipboardWork; }, false, ["y"]);
+    add("paste_after", "Paste after selections", args => this.paste(false, false, args.count), true, ["p"]);
+    add("paste_before", "Paste before selections", args => this.paste(true, false, args.count), true, ["P"]);
+    add("replace_with_yanked", "Replace with register", args => this.paste(false, true, args.count), true, ["R"]);
+    add("select_register", "Choose register", args => { this.register = String(args.character ?? '"'); });
+    add("yank_to_clipboard", "Yank to clipboard", () => { this.register = "+"; this.yank(); return this.clipboardWork; }, false, ["Space y"]);
+    add("paste_clipboard_after", "Paste clipboard after", args => { this.register = "+"; return this.paste(false, false, args.count); }, true, ["Space p"]);
+    add("paste_clipboard_before", "Paste clipboard before", args => { this.register = "+"; return this.paste(true, false, args.count); }, true, ["Space P"]);
+    add("extend_line_below", "Select lines", args => this.lines(true, args.count!), false, ["x"]);
+    add("extend_to_line_bounds", "Select line bounds", args => this.lines(false, args.count!), false, ["X"]);
+    add("select_all", "Select document", () => this.select([{ anchor: 0, head: this.text.length }]), false, ["%"]);
+    add("collapse_selection", "Collapse to cursor", () => this.select(this.ranges().map(range => characterSelection(this.text, cursorOf(this.text, range)))), false, [";"]);
+    add("keep_primary_selection", "Keep primary selection", () => this.select(this.ranges().slice(0, 1)), false, [","]);
+    add("flip_selections", "Reverse selections", () => this.select(this.ranges().map(range => ({ anchor: range.head, head: range.anchor }))), false, ["Alt-;"]);
+    add("undo", "Undo", args => this.history(false, args.count), true, ["u"]);
+    add("redo", "Redo", args => this.history(true, args.count), true, ["U"]);
+    for (const [id, key] of Object.entries({ goto_file_start: "g", goto_last_line: "e", goto_first_nonwhitespace: "s", goto_column: "|", goto_definition: "d", goto_type_definition: "y", goto_reference: "r", goto_implementation: "i" }))
+      add(id, id.replaceAll("_", " "), args => this.goto(key, args.count!), false, ["g" + key]);
+    for (const [id, key] of Object.entries({ find_next_char: "f", find_till_char: "t", find_prev_char: "F", till_prev_char: "T" }))
+      add(id, id.replaceAll("_", " "), args => this.find(key, String(args.character ?? ""), args.count!), false, [key]);
+    add("select_textobject_inner", "Select inside object", args => this.select(this.ranges().map(range => textObject(this.text, range, String(args.character), false) ?? range)));
+    add("select_textobject_around", "Select around object", args => this.select(this.ranges().map(range => textObject(this.text, range, String(args.character), true) ?? range)));
+    add("search_next", "Next search match", args => this.search(false, args.count), false, ["n"]);
+    add("search_prev", "Previous search match", args => this.search(true, args.count), false, ["N"]);
+    add("select_regex", "Select regex matches", () => this.regexPrompt("s"), false, ["s"]);
+    add("split_selection", "Split selections by regex", () => this.regexPrompt("S"), false, ["S"]);
+    add("keep_selections", "Filter selections", () => this.regexPrompt("K"), false, ["K"]);
+    for (const [id, action] of Object.entries({ indent: "editor.action.indentLines", unindent: "editor.action.outdentLines", format_selections: "editor.action.formatSelection", join_selections: "editor.action.joinLines", toggle_comments: "editor.action.commentLine", rename_symbol: "editor.action.rename" }))
+      add(id, id.replaceAll("_", " "), () => this.action(action), true);
+    for (const [id, action] of Object.entries({ hover: "editor.action.showHover", code_action: "editor.action.quickFix", match_brackets: "editor.action.jumpToBracket", page_up: "cursorPageUp", page_down: "cursorPageDown" }))
+      add(id, id.replaceAll("_", " "), () => this.action(action));
+    add("no_op", "Do nothing", () => {});
+  }
+
   private key(event: KeyboardEvent): boolean {
     const key = event.key;
     if (event.metaKey || (event.ctrlKey && event.altKey)) return false;
     if (key === "Escape" || (event.ctrlKey && key === "[")) {
       // Escape cancels pending asynchronous work even when already in Normal.
       this.revision++;
+      this.dispatcher.cancel();
       if (this.mode === "insert") this.leaveInsert();
       else this.setMode("normal");
       this.pending = this.count = "";
@@ -468,6 +529,10 @@ export class HelixController implements monaco.IDisposable {
       return true;
     }
     if (this.mode === "insert") return false;
+    if (!this.pending && !event.ctrlKey && !event.altKey && ["i", "a", "I", "A", "o", "O", "c", "v"].includes(key)) {
+      this.revision++;
+      this.dispatcher.cancel();
+    }
     if (event.ctrlKey) {
       if (key.toLowerCase() === "z") { this.history(event.shiftKey); return true; }
       const actions: Record<string, string> = { b: "cursorPageUp", f: "cursorPageDown", c: "editor.action.commentLine" };
@@ -505,8 +570,11 @@ export class HelixController implements monaco.IDisposable {
         return true;
       }
       if (prefix === "m" && (key === "i" || key === "a" || key === "s")) this.pending = "m" + key;
-      else if (prefix === "g") this.goto(key, count);
-      else if (prefix === '"') this.register = key;
+      else if (prefix === "g") {
+        const ids: Record<string,string> = {g:"goto_file_start",e:"goto_last_line",s:"goto_first_nonwhitespace","|":"goto_column",d:"goto_definition",y:"goto_type_definition",r:"goto_reference",i:"goto_implementation",h:"goto_line_start",l:"goto_line_end"};
+        if (ids[key]) this.dispatch(ids[key], {count});
+      }
+      else if (prefix === '"') this.dispatch("select_register", {character:key});
       else if (/^[ftFT]$/.test(prefix)) this.find(prefix, key, count);
       else if (prefix === "r") {
         if (this.writable()) this.replace(this.ranges().map(range => {
@@ -524,8 +592,8 @@ export class HelixController implements monaco.IDisposable {
         }));
       } else if (prefix === "m" && key === "m") this.action("editor.action.jumpToBracket");
       else if (prefix === " ") {
-        if (key === "y") { this.register = "+"; this.yank(); }
-        else if (key === "p" || key === "P") { this.register = "+"; this.paste(key === "P"); }
+        if (key === "y") this.dispatch("yank_to_clipboard");
+        else if (key === "p" || key === "P") this.dispatch(key === "P" ? "paste_clipboard_before" : "paste_clipboard_after");
         else if (key === "k") this.action("editor.action.showHover");
         else if (key === "r" && this.writable()) this.action("editor.action.rename");
         else if (key === "a") this.action("editor.action.quickFix");
@@ -540,12 +608,15 @@ export class HelixController implements monaco.IDisposable {
       return true;
     }
     this.count = "";
-    if (["h", "j", "k", "l", "w", "e", "b", "W", "E", "B", "Home", "End", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(key)) this.move(key, count);
+    if (["h", "j", "k", "l", "w", "e", "b", "W", "E", "B", "Home", "End", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(key)) {
+      const ids: Record<string,string> = { h:"move_char_left",ArrowLeft:"move_char_left",l:"move_char_right",ArrowRight:"move_char_right",j:"move_visual_line_down",ArrowDown:"move_visual_line_down",k:"move_visual_line_up",ArrowUp:"move_visual_line_up",w:"move_next_word_start",b:"move_prev_word_start",e:"move_next_word_end",W:"move_next_long_word_start",B:"move_prev_long_word_start",E:"move_next_long_word_end",Home:"goto_line_start",End:"goto_line_end" };
+      this.dispatch(ids[key], {count});
+    }
     else if (key === "v") this.setMode(this.mode === "select" ? "normal" : "select");
-    else if (["i", "a", "I", "A", "o", "O", "c"].includes(key)) this.enterInsert(key);
-    else if (key === "d") { if (this.writable()) { this.yank(); this.replace([""]); } }
-    else if (key === "y") this.yank();
-    else if (key === "p" || key === "P" || key === "R") this.paste(key === "P", key === "R", count);
+    else if (["i", "a", "I", "A", "o", "O", "c"].includes(key)) this.dispatch(({i:"insert_mode",a:"append_mode",I:"insert_at_line_start",A:"insert_at_line_end",o:"open_below",O:"open_above",c:"change_selection"} as Record<string,string>)[key]);
+    else if (key === "d") this.dispatch("delete_selection");
+    else if (key === "y") this.dispatch("yank");
+    else if (key === "p" || key === "P" || key === "R") this.dispatch(key === "p" ? "paste_after" : key === "P" ? "paste_before" : "replace_with_yanked", {count});
     else if (key === "x" || key === "X") this.lines(key === "x", count);
     else if (key === "%") this.select([{ anchor: 0, head: this.text.length }]);
     else if (key === ";") this.select(this.ranges().map(range => characterSelection(this.text, cursorOf(this.text, range))));
@@ -610,6 +681,7 @@ export class HelixController implements monaco.IDisposable {
     if (this.alive && this.mode === "insert") this.editor.pushUndoStop();
     const ranges = restoreEditor && this.alive && this.mode !== "insert" ? this.ranges() : undefined;
     this.disposed = true;
+    this.dispatcher.dispose();
     this.subscriptions.forEach(subscription => subscription.dispose());
     this.insertMarks.clear();
     this.cursorDecorations.clear();

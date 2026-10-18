@@ -2,7 +2,15 @@ import type { IDisposable } from "monaco-editor";
 
 export type HelixMode = "normal" | "insert" | "select";
 
+export interface ClipboardAdapter {
+  readText(): Promise<string>;
+  writeText(text: string): Promise<void>;
+}
+
 export interface HelixOptions {
+  /** Return false to let a host shortcut pass through untouched. */
+  shouldHandleKey?: (event: KeyboardEvent, mode: HelixMode) => boolean;
+  clipboard?: ClipboardAdapter;
   /** Application commands such as :write and :quit are delegated to the host. */
   onCommand?: (command: string) => void | Promise<void>;
   /** Receive clipboard failures, rejected host commands and unexpected errors. */
@@ -13,6 +21,9 @@ export interface HelixOptions {
 
 export interface HelixBinding extends IDisposable {
   getMode(): HelixMode;
+  execute(command: string, args?: import("./commands.js").CommandArguments): Promise<void>;
+  listCommands(): import("./commands.js").CommandInfo[];
+  cancel(): void;
   onDidChangeMode(listener: (mode: HelixMode) => void): IDisposable;
 }
 
