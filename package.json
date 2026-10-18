@@ -41,6 +41,10 @@
     "./search": {
       "types": "./dist/search.d.ts",
       "import": "./dist/search.js"
+    },
+    "./macros": {
+      "types": "./dist/macros.d.ts",
+      "import": "./dist/macros.js"
     }
   },
   "files": [

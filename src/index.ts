@@ -13,6 +13,8 @@ export type { CommandInfo, CommandArguments } from "./commands.js";
 export type { ClipboardAdapter, HelixBinding, HelixMode, HelixOptions } from "./types.js";
 export { createWorkerSearchEngine, findSearchMatches, SearchHistory, SearchPreviewSession } from "./search.js";
 export type { SearchConfiguration, SearchEngine, SearchOptions, SearchResult } from "./search.js";
+export { MacroEngine, MacroError } from "./macros.js";
+export type { MacroEvent, MacroOptions, MacroExecutionContext, MacroPlayOptions, MacroState } from "./macros.js";
 
 const bindings = new WeakMap<monaco.editor.IStandaloneCodeEditor, HelixBinding>();
 
@@ -218,10 +220,17 @@ export function initHelixMode(
         if (focus) editor.focus();
         if (disposed || generation !== current) return;
         ui.recordPrompt?.(value, prefix, !accept);
-        if (accept) {
-          config.history?.record(value);
-          await submit(value);
-        } else config.onCancel?.();
+        try {
+          if (accept) {
+            config.history?.record(value);
+            await submit(value);
+          } else config.onCancel?.();
+        } catch (error) {
+          await ui.promptSettled?.(false, error);
+          throw error;
+        }
+        if (disposed || generation !== current) return;
+        await ui.promptSettled?.(accept);
       };
       const keydown = (event: KeyboardEvent) => {
         event.stopPropagation();
@@ -256,6 +265,8 @@ export function initHelixMode(
       input.addEventListener("compositionend", compositionEnd);
       renderHints();
       input.focus();
+      if (disposed || generation !== current) return;
+      ui.promptOpened?.();
       if (initial) preview();
     },
   };
@@ -274,6 +285,8 @@ export function initHelixMode(
   const reset = () => {
     if (disposed) return;
     const current = ++generation;
+    session.macros.cancel("model changed");
+    session.macros.discard();
     cancelPrompt?.();
     controller?.dispose();
     controller = undefined;
@@ -300,6 +313,7 @@ export function initHelixMode(
   const configListener = editor.onDidChangeConfiguration(syncInput);
   let lifetime: monaco.IDisposable | undefined;
   const binding: HelixBinding = {
+    macros: session.macros,
     getMode: () => mode,
     execute: (id, args) => controller?.execute(id, args) ?? Promise.reject(new Error("No active model")),
     listCommands: () => controller?.listCommands() ?? [],
@@ -317,6 +331,7 @@ export function initHelixMode(
     dispose() {
       if (disposed) return;
       disposed = true;
+      session.macros.dispose();
       generation++;
       modelListener.dispose();
       configListener.dispose();

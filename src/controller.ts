@@ -14,10 +14,12 @@ import type { CommandArguments, CommandContext, CommandInfo } from "./commands.j
 import type { HelixOptions, HelixMode, ModalUI } from "./types.js";
 import { surroundEdits, mergeSelections, mergeConsecutiveSelections } from "./editing.js";
 import { decodeKeys, encodeKeys, KeymapEngine, KeymapError, keyFromEvent, normalizeKey } from "./keymap.js";
-import type { KeyBinding, KeyEventLike, Keymaps, KeymapTree, KeymapUpdate } from "./keymap.js";
+import type { KeyEventLike, Keymaps, KeymapTree, KeymapUpdate } from "./keymap.js";
 import type { KeyHint } from "./types.js";
 import { createSearchController } from "./search-controller.js";
 import { SearchHistory } from "./search.js";
+import { MacroEngine } from "./macros.js";
+import type { ExecutableMacroEvent, MacroExecutionContext, MacroOptions, MacroState } from "./macros.js";
 
 interface InsertHistory {
   before: number;
@@ -26,11 +28,20 @@ interface InsertHistory {
   afterSelections: HelixSelection[];
 }
 export function createSession() {
+  const target: { execute?: MacroOptions["execute"]; changed?: (state: MacroState) => void } = {};
+  const macros = new MacroEngine({
+    execute(event, signal, context) {
+      if (!target.execute) throw new DOMException("No active macro editor", "AbortError");
+      return target.execute(event, signal, context);
+    },
+    onChange: state => target.changed?.(state),
+  });
   return {
     registers: new Map<string, string[]>(),
     searchPattern: "",
     searchHistory: new SearchHistory(),
     insertHistory: new WeakMap<monaco.editor.ITextModel, InsertHistory[]>(),
+    macros, macroTarget: target,
   };
 }
 
@@ -45,8 +56,19 @@ export class HelixController implements monaco.IDisposable {
   private prefixTimer: ReturnType<typeof setTimeout> | undefined;
   private commandWork: Promise<void> = Promise.resolve();
   private continuation: { commands: string[]; count: number; signal?: AbortSignal } | undefined;
-  private keyMacroDepth = 0;
-  private keyMacroSteps = 0;
+  private macroContext: MacroExecutionContext | undefined;
+  private macroExecutor: MacroOptions["execute"];
+  private macroStatus: (state: MacroState) => void;
+  private macroInputEpoch = 0;
+  private composing = false;
+  private compositionVersion = 0;
+  private compositionCommitted: string | undefined;
+  private promptContinuation: { commands: string[]; count: number; signal?: AbortSignal } | undefined;
+  private promptCommand: Promise<void> | undefined;
+  private promptWaiters = new Set<() => void>();
+  private promptOpened: () => void;
+  private promptSettled: NonNullable<ModalUI["promptSettled"]>;
+  private recordPrompt: NonNullable<ModalUI["recordPrompt"]>;
   private clipboardWork: Promise<void> = Promise.resolve();
   private mode: HelixMode = "normal";
   private pending = "";
@@ -94,6 +116,38 @@ export class HelixController implements monaco.IDisposable {
       getPattern: () => this.session.searchPattern,
       setPattern: pattern => { this.session.searchPattern = pattern; },
     }, options.search ?? {}, session.searchHistory);
+    this.macroExecutor = (event, signal, context) => this.executeMacroEvent(event, signal, context);
+    this.macroStatus = state => {
+      this.macroInputEpoch++;
+      if (this.alive) this.ui.notify(state.recording ? `Recording macro ${state.recording}` : state.playing ? "Playing macro" : "");
+    };
+    session.macroTarget.execute = this.macroExecutor;
+    session.macroTarget.changed = this.macroStatus;
+    this.recordPrompt = (value, prefix, cancel) => {
+      if (this.session.macros.isRecording) this.session.macros.record({ type: "prompt", value, prefix, ...(cancel ? { cancel: true } : {}) });
+    };
+    this.promptOpened = () => { for (const opened of [...this.promptWaiters]) opened(); };
+    this.promptSettled = async (accepted, error) => {
+      const continuation = this.promptContinuation;
+      const command = this.promptCommand;
+      this.promptContinuation = undefined;
+      this.promptCommand = undefined;
+      if (!accepted || error || !this.alive) {
+        this.dispatcher.cancel();
+        await command?.catch(() => {});
+        return;
+      }
+      // Pickers may hold the dispatcher while their prompt is open. Submission
+      // releases that command before a destructive sequence can continue.
+      await command;
+      if (!continuation || !this.alive) return;
+      const work = this.runCommands(continuation.commands, continuation.count, continuation.signal);
+      this.track(work);
+      await work;
+    };
+    ui.recordPrompt = this.recordPrompt;
+    ui.promptSettled = this.promptSettled;
+    ui.promptOpened = this.promptOpened;
     this.insertMarks = editor.createDecorationsCollection();
     this.cursorDecorations = editor.createDecorationsCollection();
     this.subscriptions.push(
@@ -106,7 +160,24 @@ export class HelixController implements monaco.IDisposable {
         try {
           if (event.browserEvent.key !== "Escape" && this.options.shouldHandleKey?.(event.browserEvent, this.mode) === false) return;
           const token = keyFromEvent(event.browserEvent);
-          if (!token || !this.routeKey(token, event.browserEvent)) return;
+          if (!token) return;
+          if (this.session.macros.isPlaying) this.cancel();
+          const previousMode = this.mode;
+          const prefix = [...this.keyPrefix];
+          const binding = this.keymap.lookup(this.mode, [...prefix, token]);
+          const control = binding.kind === "commands" && binding.commands.includes("record_macro");
+          // Record q before it starts playback, which suppresses generated
+          // events. Prefix/count/register keys retain their remapping semantics.
+          const recorded = !control && previousMode !== "insert" && this.session.macros.isRecording;
+          if (recorded) this.session.macros.record({ type: "key", key: token });
+          const handled = this.routeKey(token, event.browserEvent);
+          if (!recorded && !control && this.session.macros.isRecording) {
+            if (token === "esc" || token === "C-[") this.session.macros.record({ type: "key", key: token });
+            else if (handled && binding.kind !== "pending" && !(binding.kind === "unbound" && !binding.explicit && prefix.length)) {
+              for (const key of [...prefix, token]) this.session.macros.record({ type: "key", key });
+            } else if (!handled && this.nativeInsertCommand(token)) this.session.macros.record({ type: "key", key: token });
+          }
+          if (!handled) return;
         } catch (error) { this.ui.error(error); }
         event.preventDefault();
         event.stopPropagation();
@@ -122,12 +193,16 @@ export class HelixController implements monaco.IDisposable {
         if (this.mode === "insert") this.insertChanged = true;
         else if (this.alive) this.normalize();
       }),
+      editor.onDidChangeConfiguration(event => {
+        if (event.hasChanged(monaco.editor.EditorOption.readOnly) && this.readOnly) this.cancel();
+      }),
     );
     const root = editor.getDomNode();
     if (root) {
       const flush = () => { if (this.mode === "insert") this.clearKeyPrefix(true); };
       root.addEventListener("compositionstart", flush, true);
       this.subscriptions.push({ dispose: () => root.removeEventListener("compositionstart", flush, true) });
+      this.captureMacroInput(root);
     }
     this.setMode("normal");
     this.normalize();
@@ -473,8 +548,13 @@ export class HelixController implements monaco.IDisposable {
   }
 
   execute(command: string, args: CommandArguments = {}, signal?: AbortSignal): Promise<void> {
+    if (command === "replay_macro") {
+      const register = typeof args.register === "string" ? args.register : this.macroRegister();
+      const count = Math.max(1, Math.min(10_000, Math.trunc(Number(args.count)) || 1));
+      return this.macroContext ? this.macroContext.play(register, count) : this.session.macros.play(register, count, { signal });
+    }
     if (command.startsWith(":")) return this.execute("host_command", { ...args, command: command.slice(1) }, signal);
-    return this.dispatcher.execute(command, { ...args, count: Math.max(1, Math.min(10000, Number(args.count) || 1)) }, signal);
+    return this.dispatcher.execute(command, { ...args, count: Math.max(1, Math.min(10000, Math.trunc(Number(args.count)) || 1)) }, signal);
   }
   listCommands(): CommandInfo[] { return this.dispatcher.list(); }
   setKeymap(keymap: Keymaps): KeymapUpdate {
@@ -490,11 +570,12 @@ export class HelixController implements monaco.IDisposable {
   async feedKey(key: string, signal?: AbortSignal): Promise<void> {
     if (!this.alive || signal?.aborted) throw new DOMException("Key input cancelled", "AbortError");
     const token = normalizeKey(key);
+    if (this.ui.promptActive?.()) throw new Error("A macro prompt response is required before more keys");
     const previous = this.commandWork;
     const handled = this.routeKey(token, undefined, signal);
-    if (!handled && this.mode === "insert") this.insertUnbound(token);
+    if (!handled && this.mode === "insert") this.insertUnbound(token, true);
     if (this.commandWork !== previous) await this.commandWork;
-    await this.dispatcher.idle();
+    if (!this.ui.promptActive?.()) await this.dispatcher.idle();
     if (!this.alive || signal?.aborted) throw new DOMException("Key input cancelled", "AbortError");
   }
   async feedKeys(keys: string, signal?: AbortSignal): Promise<void> {
@@ -518,6 +599,10 @@ export class HelixController implements monaco.IDisposable {
     this.revision++;
     this.clearKeyPrefix(false);
     this.continuation = undefined;
+    this.promptContinuation = undefined;
+    this.promptCommand = undefined;
+    this.macroContext = undefined;
+    this.session.macros.cancel("cancelled by editor");
     this.dispatcher.cancel();
     this.searchController.cancel();
     this.pending = this.count = "";
@@ -535,10 +620,14 @@ export class HelixController implements monaco.IDisposable {
     const insert = this.prefixMode === "insert";
     this.keyPrefix = [];
     this.prefixMode = undefined;
-    if (flush && insert && this.alive && this.mode === "insert") for (const key of keys) this.insertUnbound(key);
+    if (flush && insert && this.alive && this.mode === "insert") for (const key of keys) this.insertUnbound(key, true);
   }
 
-  private insertUnbound(key: string): void {
+  private nativeInsertCommand(key: string): boolean {
+    return ["ret", "tab", "S-tab", "backspace", "del", "left", "right", "up", "down", "home", "end", "pageup", "pagedown", "C-backspace", "A-backspace", "C-del", "C-w", "A-d", "C-h", "C-d", "C-u", "C-k"].includes(key);
+  }
+
+  private insertUnbound(key: string, record = false): void {
     if (!this.writable()) return;
     const input: Record<string, string> = { space: " ", ret: this.model.getEOL() };
     const actions: Record<string, string> = {
@@ -546,10 +635,111 @@ export class HelixController implements monaco.IDisposable {
       left: "cursorLeft", right: "cursorRight", up: "cursorUp", down: "cursorDown",
       home: "cursorHome", end: "cursorEnd", pageup: "cursorPageUp", pagedown: "cursorPageDown",
       "C-backspace": "deleteWordLeft", "A-backspace": "deleteWordLeft", "C-del": "deleteWordRight",
+      "C-w": "deleteWordLeft", "A-d": "deleteWordRight", "C-h": "deleteLeft", "C-d": "deleteRight",
+      "C-u": "deleteAllLeft", "C-k": "deleteAllRight",
     };
-    if (actions[key]) { this.action(actions[key]); return; }
+    if (actions[key]) {
+      if (record) this.session.macros.record({ type: "key", key });
+      this.action(actions[key]); return;
+    }
     const text = input[key] ?? (nextChar(key, 0) === key.length && !key.includes("\n") ? key : undefined);
-    if (text !== undefined) this.editor.trigger("helix", "type", { text });
+    if (text !== undefined) {
+      const before = this.model.getVersionId();
+      this.editor.trigger("helix", "type", { text });
+      if (record && before !== this.model.getVersionId()) this.session.macros.record({ type: "text", text });
+    }
+  }
+
+  private captureMacroInput(root: HTMLElement): void {
+    const area = (event: Event) => (event.target as HTMLElement | null)?.classList?.contains("inputarea");
+    const recordText = (text: string, before: number) => {
+      const epoch = this.macroInputEpoch;
+      queueMicrotask(() => {
+        if (this.alive && this.mode === "insert" && epoch === this.macroInputEpoch && before !== this.model.getVersionId()) {
+          try { this.session.macros.record({ type: "text", text }); }
+          catch (error) { this.ui.error(error); }
+        }
+      });
+    };
+    const start = (event: Event) => {
+      if (!area(event) || this.mode !== "insert") return;
+      if (this.session.macros.isPlaying) this.cancel();
+      this.composing = true;
+      this.compositionVersion = this.model.getVersionId();
+      this.compositionCommitted = undefined;
+    };
+    const end = (event: Event) => {
+      if (!area(event) || !this.composing) return;
+      this.composing = false;
+      const text = (event as CompositionEvent).data;
+      this.compositionCommitted = text;
+      if (text) recordText(text, this.compositionVersion);
+      setTimeout(() => { if (this.compositionCommitted === text) this.compositionCommitted = undefined; }, 0);
+    };
+    let pasteText: string | undefined;
+    let pendingInput: { text: string; before: number } | undefined;
+    const beforeInput = (event: Event) => {
+      if (!area(event) || this.mode !== "insert") return;
+      if (this.session.macros.isPlaying) this.cancel();
+      const input = event as InputEvent;
+      if (this.composing || input.isComposing || input.inputType === "insertCompositionText") return;
+      if (!input.inputType.startsWith("insert") || !input.data || this.compositionCommitted === input.data) return;
+      if (input.inputType === "insertFromPaste" && pasteText !== undefined) return;
+      pendingInput = { text: input.data, before: this.model.getVersionId() };
+    };
+    const input = (event: Event) => {
+      if (!area(event)) return;
+      const pending = pendingInput;
+      pendingInput = undefined;
+      // Chromium can run a microtask checkpoint between beforeinput and input;
+      // Monaco commits its textarea change before this root input bubble hook.
+      if (pending) recordText(pending.text, pending.before);
+    };
+    const paste = (event: Event) => {
+      if (!area(event) || this.mode !== "insert") return;
+      pasteText = (event as ClipboardEvent).clipboardData?.getData("text/plain");
+      if (pasteText !== undefined) recordText(pasteText, this.model.getVersionId());
+      setTimeout(() => { pasteText = undefined; }, 0);
+    };
+    for (const [name, handler] of [["compositionstart", start], ["compositionend", end], ["beforeinput", beforeInput], ["input", input], ["paste", paste]] as const) {
+      const capture = name !== "input";
+      root.addEventListener(name, handler, capture);
+      this.subscriptions.push({ dispose: () => root.removeEventListener(name, handler, capture) });
+    }
+  }
+
+  private macroRegister(): string {
+    const register = this.register === '"' ? "@" : this.register;
+    this.register = '"';
+    return register;
+  }
+
+  private async executeMacroEvent(event: ExecutableMacroEvent, signal: AbortSignal, context: MacroExecutionContext): Promise<void> {
+    if (!this.alive || signal.aborted) throw new DOMException("Macro cancelled", "AbortError");
+    const previous = this.macroContext;
+    this.macroContext = context;
+    try {
+      if (event.type === "key") await this.feedKey(event.key, signal);
+      else if (event.type === "text") {
+        if (this.ui.promptActive?.()) throw new Error("A macro prompt response is required before inserted text");
+        if (this.mode !== "insert") throw new Error("Macro text requires Insert mode");
+        if (this.readOnly) throw new Error("Read-only editor");
+        this.editor.trigger("helix", "type", { text: event.text });
+      } else {
+        if (!this.ui.submitPrompt) throw new Error("This host cannot replay prompt responses");
+        await this.ui.submitPrompt(event.value, event.prefix, event.cancel);
+        if (event.cancel) throw new DOMException("Macro prompt cancelled", "AbortError");
+      }
+      if (!this.alive || signal.aborted) throw new DOMException("Macro cancelled", "AbortError");
+    } catch (error) {
+      this.promptContinuation = undefined;
+      if (this.alive && this.ui.promptActive?.()) await this.ui.submitPrompt?.("", undefined, true).catch(() => {});
+      throw error;
+    } finally {
+      // Cancellation may clear the active context while an async host settles.
+      // An old executor must not restore a cancelled parent into the new input.
+      if (this.macroContext === context) this.macroContext = signal.aborted ? undefined : previous;
+    }
   }
 
   private logicalEvent(token: string): KeyEventLike & { code: string; ctrlKey: boolean; altKey: boolean; shiftKey: boolean; metaKey: boolean } {
@@ -637,7 +827,12 @@ export class HelixController implements monaco.IDisposable {
   private async runCommands(commands: readonly string[], count: number, signal?: AbortSignal): Promise<void> {
     for (let index = 0; index < commands.length; index++) {
       if (!this.alive || signal?.aborted) throw new DOMException("Command sequence cancelled", "AbortError");
-      await this.execute(commands[index], { count }, signal);
+      const command = this.execute(commands[index], { count }, signal);
+      if (!await this.awaitCommandOrPrompt(command)) {
+        this.promptCommand = command;
+        if (index < commands.length - 1) this.promptContinuation = { commands: commands.slice(index + 1), count, signal };
+        return;
+      }
       if (this.pending && index < commands.length - 1) {
         this.continuation = { commands: commands.slice(index + 1), count, signal };
         return;
@@ -645,17 +840,33 @@ export class HelixController implements monaco.IDisposable {
     }
   }
 
+  private awaitCommandOrPrompt(command: Promise<void>): Promise<boolean> {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => { settled = true; this.promptWaiters.delete(opened); };
+      const opened = () => {
+        if (settled || !this.ui.promptActive?.()) return;
+        cleanup();
+        resolve(false);
+      };
+      this.promptWaiters.add(opened);
+      command.then(() => {
+        if (settled) return;
+        const complete = !this.ui.promptActive?.();
+        cleanup();
+        resolve(complete);
+      }, error => {
+        if (settled) return;
+        cleanup();
+        reject(error);
+      });
+      opened();
+    });
+  }
+
   private async runKeyMacro(keys: readonly string[], signal?: AbortSignal): Promise<void> {
-    if (this.keyMacroDepth >= 32) throw new Error("Key macro recursion exceeds 32 levels");
-    const outer = this.keyMacroDepth++ === 0;
-    if (outer) this.keyMacroSteps = 0;
-    try {
-      for (const key of keys) {
-        if (++this.keyMacroSteps > 100_000) throw new Error("Key macro playback exceeds 100000 keys");
-        if (this.keyMacroSteps % 128 === 0) await new Promise<void>(resolve => setTimeout(resolve, 0));
-        await this.feedKey(key, signal);
-      }
-    } finally { this.keyMacroDepth--; }
+    if (this.macroContext) await this.macroContext.playKeys(keys);
+    else await this.session.macros.playKeys(keys, 1, { signal });
   }
 
   private defaultKeymap(): Keymaps {
@@ -688,6 +899,7 @@ export class HelixController implements monaco.IDisposable {
       ">": "indent", "<": "unindent", "=": "format_selections", J: "join_selections",
       "/": "search", "?": "rsearch", "*": "search_selection_detect_word_boundaries", ":": "command_mode",
       r: "replace", G: "goto_line", '"': "select_register", esc: "normal_mode",
+      Q: "record_macro", q: "replay_macro",
     };
     for (const [key, command] of Object.entries(aliases)) assign([normalizeKey(key)], command);
     for (const [key, command] of Object.entries({ h: "goto_line_start", l: "goto_line_end" })) assign(["g", key], command);
@@ -835,6 +1047,14 @@ export class HelixController implements monaco.IDisposable {
     });
     add("command_mode", "Open command prompt", () => this.ui.prompt(":", value => this.ui.command(value)));
     add("host_command", "Run a host application command", args => this.ui.command(String(args.command ?? "")));
+    add("record_macro", "Start or stop recording a macro", args => {
+      if (this.session.macros.isPlaying) throw new Error("Cannot change macro recording during playback");
+      if (this.session.macros.isRecording) this.session.macros.stop();
+      else this.session.macros.start(typeof args.register === "string" ? args.register : this.macroRegister());
+    });
+    // execute() routes replay around the command queue, so its own replayed
+    // commands can use the dispatcher without waiting behind their parent.
+    add("replay_macro", "Replay the selected macro", () => { throw new Error("Macro replay requires the controller execution entrypoint"); });
   }
 
   private awaitCharacter(prefix: string, count: number): void {
@@ -1031,8 +1251,16 @@ export class HelixController implements monaco.IDisposable {
     if (this.alive && this.mode === "insert") this.editor.pushUndoStop();
     const ranges = restoreEditor && this.alive && this.mode !== "insert" ? this.ranges() : undefined;
     this.disposed = true;
+    this.session.macros.cancel("model detached");
+    this.session.macros.discard();
+    if (this.session.macroTarget.execute === this.macroExecutor) this.session.macroTarget.execute = undefined;
+    if (this.session.macroTarget.changed === this.macroStatus) this.session.macroTarget.changed = undefined;
+    if (this.ui.recordPrompt === this.recordPrompt) this.ui.recordPrompt = undefined;
+    if (this.ui.promptSettled === this.promptSettled) this.ui.promptSettled = undefined;
+    if (this.ui.promptOpened === this.promptOpened) this.ui.promptOpened = undefined;
     this.clearKeyPrefix(false);
     this.continuation = undefined;
+    this.promptContinuation = undefined;
     this.dispatcher.dispose();
     this.searchController.dispose();
     this.subscriptions.forEach(subscription => subscription.dispose());

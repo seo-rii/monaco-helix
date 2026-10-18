@@ -1,6 +1,7 @@
 import type { IDisposable } from "monaco-editor";
 import type { Keymaps, KeymapUpdate } from "./keymap.js";
 import type { SearchConfiguration } from "./search.js";
+import type { MacroEngine } from "./macros.js";
 
 export type HelixMode = "normal" | "insert" | "select";
 
@@ -26,6 +27,7 @@ export interface HelixOptions {
 }
 
 export interface HelixBinding extends IDisposable {
+  readonly macros: MacroEngine;
   getMode(): HelixMode;
   execute(command: string, args?: import("./commands.js").CommandArguments): Promise<void>;
   listCommands(): import("./commands.js").CommandInfo[];
@@ -57,5 +59,7 @@ export interface ModalUI {
   promptActive?: () => boolean;
   submitPrompt?: (value: string, prefix?: string, cancel?: boolean) => Promise<void>;
   recordPrompt?: (value: string, prefix: string, cancel: boolean) => void;
+  promptSettled?: (accepted: boolean, error?: unknown) => void | Promise<void>;
+  promptOpened?: () => void;
   error: (error: unknown) => void;
 }
