@@ -1,9 +1,13 @@
 import * as monaco from 'monaco-editor';
 import EditorWorker from 'monaco-editor/esm/vs/editor/editor.worker?worker';
+import TypeScriptWorker from 'monaco-editor/esm/vs/language/typescript/ts.worker?worker';
 import { initHelixMode } from '../../src/index';
 import '../../src/styles.css';
 
-self.MonacoEnvironment = { getWorker: () => new EditorWorker() };
+self.MonacoEnvironment = {
+  getWorker: (_moduleId: string, label: string) =>
+    label === 'typescript' || label === 'javascript' ? new TypeScriptWorker() : new EditorWorker(),
+};
 
 const editor = monaco.editor.create(document.getElementById('editor')!, {
   value: 'alpha beta\nsecond line\nthird',

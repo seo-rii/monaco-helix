@@ -4,6 +4,7 @@ import type { SearchConfiguration } from "./search.js";
 import type { MacroEngine } from "./macros.js";
 import type { HostAdapter } from "./navigation.js";
 import type { NavigationConfiguration } from "./host-controller.js";
+import type { SyntaxProvider } from "./syntax.js";
 
 export type HelixMode = "normal" | "insert" | "select";
 
@@ -22,6 +23,8 @@ export interface HelixOptions {
   search?: SearchConfiguration;
   host?: HostAdapter;
   navigation?: NavigationConfiguration;
+  /** Optional parser-independent syntax selection provider, owned by the host. */
+  syntaxProvider?: SyntaxProvider;
   /** Application commands such as :write and :quit are delegated to the host. */
   onCommand?: (command: string) => void | Promise<void>;
   /** Receive clipboard failures, rejected host commands and unexpected errors. */

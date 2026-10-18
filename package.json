@@ -49,7 +49,17 @@
     "./navigation": {
       "types": "./dist/navigation.d.ts",
       "import": "./dist/navigation.js"
-    }
+    },
+    "./syntax": {
+      "types": "./dist/syntax.d.ts",
+      "import": "./dist/syntax.js"
+    },
+    "./tree-sitter": {
+      "types": "./dist/tree-sitter.d.ts",
+      "import": "./dist/tree-sitter.js"
+    },
+    "./syntax-worker": "./dist/syntax-worker.js",
+    "./syntax-assets/*": "./dist/syntax-assets/*"
   },
   "files": [
     "dist",
@@ -64,13 +74,14 @@
     "**/*.css"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && node scripts/copy-style.mjs",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-style.mjs && node scripts/copy-syntax-assets.mjs",
     "prepare": "npm run build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:browser": "playwright test",
     "dev": "vite --host 127.0.0.1",
-    "check": "npm run typecheck && npm test && npm run build && npm run test:browser"
+    "check": "npm run typecheck && npm test && npm run test:package && npm run test:browser",
+    "test:package": "npm run build && node scripts/verify-package.mjs"
   },
   "peerDependencies": {
     "monaco-editor": "^0.55.1"
@@ -80,12 +91,16 @@
     "monaco-editor": "0.55.1",
     "typescript": "^5.9.3",
     "vite": "^7.3.1",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "tree-sitter-wasms": "0.1.13"
   },
   "engines": {
     "node": ">=22"
   },
   "dependencies": {
     "smol-toml": "^1.9.1"
+  },
+  "optionalDependencies": {
+    "web-tree-sitter": "0.25.10"
   }
 }

@@ -20,6 +20,8 @@ import { createSearchController } from "./search-controller.js";
 import { SearchHistory } from "./search.js";
 import { MacroEngine } from "./macros.js";
 import type { ExecutableMacroEvent, MacroExecutionContext, MacroOptions, MacroState } from "./macros.js";
+import { SyntaxController, syntaxCommands, syntaxTextObjects } from "./syntax-controller.js";
+import type { SyntaxOperation } from "./syntax.js";
 
 interface InsertHistory {
   before: number;
@@ -50,6 +52,7 @@ type Session = ReturnType<typeof createSession>;
 export class HelixController implements monaco.IDisposable {
   private dispatcher: CommandDispatcher;
   private searchController: ReturnType<typeof createSearchController>;
+  private syntaxController: SyntaxController | undefined;
   private keymap: KeymapEngine;
   private keyPrefix: string[] = [];
   private prefixMode: HelixMode | undefined;
@@ -206,6 +209,7 @@ export class HelixController implements monaco.IDisposable {
     }
     this.setMode("normal");
     this.normalize();
+    if (options.syntaxProvider) this.syntaxController = new SyntaxController(editor, options.syntaxProvider, ranges => this.select(ranges));
   }
 
   private get alive() {
@@ -611,6 +615,7 @@ export class HelixController implements monaco.IDisposable {
     this.session.macros.cancel("cancelled by editor");
     this.dispatcher.cancel();
     this.searchController.cancel();
+    this.syntaxController?.cancel();
     this.pending = this.count = "";
     this.status();
   }
@@ -955,14 +960,32 @@ export class HelixController implements monaco.IDisposable {
         if (args.character === undefined) this.awaitCharacter(key, args.count!);
         else this.find(key, String(args.character), args.count!);
       }, false, [key]);
-    add("select_textobject_inner", "Select inside object", args => {
+    add("select_textobject_inner", "Select inside object", (args, context) => {
       if (args.character === undefined) this.awaitCharacter("mi", args.count!);
-      else this.select(this.ranges().map(range => textObject(this.text, range, String(args.character), false) ?? range));
+      else return this.selectTextObject(String(args.character), false, args.count!, context.signal);
     });
-    add("select_textobject_around", "Select around object", args => {
+    add("select_textobject_around", "Select around object", (args, context) => {
       if (args.character === undefined) this.awaitCharacter("ma", args.count!);
-      else this.select(this.ranges().map(range => textObject(this.text, range, String(args.character), true) ?? range));
+      else return this.selectTextObject(String(args.character), true, args.count!, context.signal);
     });
+    const syntaxKeys: Record<string, string[]> = {
+      expand_selection: ["Alt-o", "Alt-ArrowUp"], shrink_selection: ["Alt-i", "Alt-ArrowDown"],
+      select_prev_sibling: ["Alt-p", "Alt-ArrowLeft"], select_next_sibling: ["Alt-n", "Alt-ArrowRight"],
+      select_all_siblings: ["Alt-a"], select_all_children: ["Alt-I", "Alt-Shift-ArrowDown"],
+      move_parent_node_start: ["Alt-b"], move_parent_node_end: ["Alt-e"],
+      goto_next_function: ["]f"], goto_prev_function: ["[f"],
+      goto_next_class: ["]t"], goto_prev_class: ["[t"],
+      goto_next_parameter: ["]a"], goto_prev_parameter: ["[a"],
+      goto_next_comment: ["]c"], goto_prev_comment: ["[c"],
+      goto_next_test: ["]T"], goto_prev_test: ["[T"],
+    };
+    for (const [id, operation] of Object.entries(syntaxCommands)) add(id, id.replaceAll("_", " "), async (args, context) => {
+      if ("object" in operation) await this.executeSyntax({ ...operation, count: args.count }, context.signal);
+      else {
+        const repeat = ["parent", "child", "previousSibling", "nextSibling"].includes(operation.kind) ? args.count! : 1;
+        for (let index = 0; index < repeat; index++) await this.executeSyntax(operation, context.signal);
+      }
+    }, false, syntaxKeys[id]);
     add("search_next", "Next search match", (args, context) => this.searchController.next(false, args.count, context.signal), false, ["n"]);
     add("search_prev", "Previous search match", (args, context) => this.searchController.next(true, args.count, context.signal), false, ["N"]);
     add("select_regex", "Select regex matches", () => this.regexPrompt("s"), false, ["s"]);
@@ -1078,6 +1101,17 @@ export class HelixController implements monaco.IDisposable {
     this.status();
   }
 
+  private selectTextObject(character: string, around: boolean, count: number, signal?: AbortSignal): void | Promise<void> {
+    const object = Object.hasOwn(syntaxTextObjects, character) ? syntaxTextObjects[character] : undefined;
+    if (object) return this.executeSyntax({ kind: "object", object, around, count }, signal);
+    this.select(this.ranges().map(range => textObject(this.text, range, character, around) ?? range));
+  }
+
+  private executeSyntax(operation: SyntaxOperation, signal?: AbortSignal): Promise<void> {
+    if (!this.syntaxController) throw new Error("A syntax provider is required for this command");
+    return this.syntaxController.execute(operation, signal, this.mode === "select");
+  }
+
   private replaceCharacters(character: string): void {
     if (!this.writable()) return;
     this.replace(this.ranges().map(range => {
@@ -1101,6 +1135,7 @@ export class HelixController implements monaco.IDisposable {
       this.revision++;
       this.dispatcher.cancel();
       this.searchController.cancel();
+      this.syntaxController?.cancel();
       if (this.mode === "insert") this.leaveInsert();
       else this.setMode("normal");
       this.pending = this.count = "";
@@ -1168,7 +1203,7 @@ export class HelixController implements monaco.IDisposable {
             .map(part => /\r?\n/.test(part.segment) ? part.segment : key === "Enter" ? this.model.getEOL() : key).join("");
         }));
       } else if (prefix === "mi" || prefix === "ma") {
-        this.select(this.ranges().map(range => textObject(this.text, range, key, prefix === "ma") ?? range));
+        this.dispatch(prefix === "ma" ? "select_textobject_around" : "select_textobject_inner", { character: key, count });
       } else if (prefix === "ms" && this.writable()) {
         const close = ({ "(": ")", "[": "]", "{": "}", "<": ">" } as Record<string, string>)[key] ?? key;
         this.replace(this.ranges().map(range => {
@@ -1278,6 +1313,7 @@ export class HelixController implements monaco.IDisposable {
     this.promptContinuation = undefined;
     this.dispatcher.dispose();
     this.searchController.dispose();
+    this.syntaxController?.dispose();
     this.subscriptions.forEach(subscription => subscription.dispose());
     this.insertMarks.clear();
     this.cursorDecorations.clear();

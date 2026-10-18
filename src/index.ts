@@ -17,6 +17,7 @@ export { createWorkerSearchEngine, findSearchMatches, SearchHistory, SearchPrevi
 export type { SearchConfiguration, SearchEngine, SearchOptions, SearchResult } from "./search.js";
 export { MacroEngine, MacroError } from "./macros.js";
 export type { MacroEvent, MacroOptions, MacroExecutionContext, MacroPlayOptions, MacroState } from "./macros.js";
+export type { SyntaxProvider, SyntaxDocument, SyntaxRequest, SyntaxResult, SyntaxOperation, SyntaxObject } from "./syntax.js";
 
 const bindings = new WeakMap<monaco.editor.IStandaloneCodeEditor, HelixBinding>();
 

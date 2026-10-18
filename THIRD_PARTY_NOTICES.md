@@ -46,3 +46,33 @@ SOFTWARE.
 [`monaco-editor`](https://github.com/microsoft/monaco-editor) is a peer dependency
 provided by the consuming application. It is distributed by Microsoft under the
 MIT License. Consult its distribution for its license and third-party notices.
+
+## TOML parser
+
+The optional `monaco-helix/toml` entrypoint imports
+[`smol-toml`](https://github.com/squirrelchat/smol-toml), distributed separately
+as an npm dependency under the BSD 3-Clause License. Copyright belongs to
+Squirrel Chat et al. Its distribution retains the full license text.
+
+## Optional Tree-sitter runtime and grammar assets
+
+The build copies the WASM runtime from `web-tree-sitter` **0.25.10** (MIT) and
+three prebuilt grammar binaries from `tree-sitter-wasms` **0.1.13** (Unlicense).
+The grammar projects retain their own MIT notices:
+
+| Grammar | Copyright | License source |
+| --- | --- | --- |
+| Python | 2016 Max Brunsfeld | [tree-sitter-python v0.21.0](https://github.com/tree-sitter/tree-sitter-python/blob/v0.21.0/LICENSE) |
+| C++ | 2014 Max Brunsfeld | [tree-sitter-cpp v0.20.4](https://github.com/tree-sitter/tree-sitter-cpp/blob/v0.20.4/LICENSE) |
+| TypeScript | 2017 GitHub | [tree-sitter-typescript v0.20.5](https://github.com/tree-sitter/tree-sitter-typescript/blob/v0.20.5/LICENSE) |
+
+The source tags above identify the license notices; the prebuilt package's
+declared source ranges do not identify exact grammar source commits. The lockfile
+pins the prebuilt tarball. The generated `dist/syntax-assets/manifest.json`
+records each shipped binary's byte length and SHA-256 hash.
+
+The distributed assets include `dist/syntax-assets/LICENSES.txt`, containing the
+runtime and prebuilt package's license texts plus the three grammar notices.
+See the [asset copy script](scripts/copy-syntax-assets.mjs) and
+[syntax deployment guide](docs/syntax.md). The textobject queries in this
+package are original implementations of the documented capture contract.
