@@ -211,3 +211,33 @@ test('preserves a new binding when the host reinitializes during disposal', asyn
   await page.keyboard.press('Escape');
   await expect.poll(() => page.evaluate(() => window.editor.getValue())).toBe('!alpha beta\nsecond line\nthird');
 });
+
+for (const invalid of ['keymap', 'chord timeout'] as const) {
+  test(`cleans up a failed initial ${invalid} configuration`, async ({ page }) => {
+    const outcome = await page.evaluate(kind => {
+      window.helix.dispose();
+      window.editor.updateOptions({ editContext: true, cursorStyle: 'line' });
+      let message = '';
+      try {
+        window.initHelixMode(window.editor, document.getElementById('status')!, kind === 'keymap'
+          ? { keymap: { normal: { d: 'missing_command_for_test' } } }
+          : { chordTimeoutMs: -1 });
+      } catch (error) { message = (error as Error).message; }
+      const result = {
+        message,
+        statuses: document.querySelectorAll('.monaco-helix-status').length,
+        editContext: window.editor.getRawOptions().editContext,
+        cursorStyle: window.editor.getRawOptions().cursorStyle,
+      };
+      // Exercise the textarea path after verifying the original option restoration.
+      window.editor.updateOptions({ editContext: false });
+      window.editor.setPosition({ lineNumber: 1, column: 1 });
+      window.editor.focus();
+      return result;
+    }, invalid);
+    expect(outcome.message).toMatch(invalid === 'keymap' ? /Unsupported command/ : /chordTimeoutMs/);
+    expect(outcome).toMatchObject({ statuses: 0, editContext: true, cursorStyle: 'line' });
+    await page.keyboard.insertText('Z');
+    await expect.poll(() => page.evaluate(() => window.editor.getValue())).toBe('Zalpha beta\nsecond line\nthird');
+  });
+}

@@ -379,6 +379,10 @@ export function initHelixMode(
   };
   lifetime = editor.onDidDispose(() => binding.dispose());
   bindings.set(editor, binding);
-  reset();
+  try { reset(); }
+  catch (error) {
+    binding.dispose();
+    throw error;
+  }
   return binding;
 }
