@@ -29,7 +29,15 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
-    "./style.css": "./dist/styles.css"
+    "./style.css": "./dist/styles.css",
+    "./keymap": {
+      "types": "./dist/keymap.d.ts",
+      "import": "./dist/keymap.js"
+    },
+    "./toml": {
+      "types": "./dist/toml.d.ts",
+      "import": "./dist/toml.js"
+    }
   },
   "files": [
     "dist",
@@ -64,5 +72,8 @@
   },
   "engines": {
     "node": ">=22"
+  },
+  "dependencies": {
+    "smol-toml": "^1.9.1"
   }
 }

@@ -13,6 +13,9 @@ import { CommandDispatcher, isCancellation } from "./commands.js";
 import type { CommandArguments, CommandInfo } from "./commands.js";
 import type { HelixOptions, HelixMode, ModalUI } from "./types.js";
 import { surroundEdits, mergeSelections, mergeConsecutiveSelections } from "./editing.js";
+import { decodeKeys, encodeKeys, KeymapEngine, KeymapError, keyFromEvent, normalizeKey } from "./keymap.js";
+import type { KeyBinding, KeyEventLike, Keymaps, KeymapTree, KeymapUpdate } from "./keymap.js";
+import type { KeyHint } from "./types.js";
 
 interface InsertHistory {
   before: number;
@@ -32,6 +35,14 @@ type Session = ReturnType<typeof createSession>;
 
 export class HelixController implements monaco.IDisposable {
   private dispatcher: CommandDispatcher;
+  private keymap: KeymapEngine;
+  private keyPrefix: string[] = [];
+  private prefixMode: HelixMode | undefined;
+  private prefixTimer: ReturnType<typeof setTimeout> | undefined;
+  private commandWork: Promise<void> = Promise.resolve();
+  private continuation: { commands: string[]; count: number; signal?: AbortSignal } | undefined;
+  private keyMacroDepth = 0;
+  private keyMacroSteps = 0;
   private clipboardWork: Promise<void> = Promise.resolve();
   private mode: HelixMode = "normal";
   private pending = "";
@@ -64,17 +75,27 @@ export class HelixController implements monaco.IDisposable {
     this.boundModel = editor.getModel()!;
     this.dispatcher = new CommandDispatcher(() => this.alive, () => this.readOnly);
     this.registerCommands();
+    if (options.chordTimeoutMs !== undefined && (!Number.isFinite(options.chordTimeoutMs) || options.chordTimeoutMs < 0 || options.chordTimeoutMs > 60_000)) {
+      throw new Error("chordTimeoutMs must be between 0 and 60000");
+    }
+    // Compile before subscriptions or decorations exist, so an invalid initial
+    // map cannot leave an inaccessible, partially attached controller behind.
+    this.keymap = new KeymapEngine(this.defaultKeymap(), { commands: this.listCommands().map(command => command.id) });
+    const configured = this.keymap.replace(options.keymap ?? {});
+    if (!configured.ok) throw new KeymapError(configured.diagnostics);
     this.insertMarks = editor.createDecorationsCollection();
     this.cursorDecorations = editor.createDecorationsCollection();
     this.subscriptions.push(
       editor.onKeyDown(event => {
         // Monaco may already have consumed Escape to dismiss a widget. It must
         // still leave Insert/Select and cancel incomplete Helix commands.
-        if ((event.browserEvent.defaultPrevented && event.browserEvent.key !== "Escape") || event.browserEvent.isComposing) return;
+        if (event.browserEvent.isComposing) { this.clearKeyPrefix(true); return; }
+        if (event.browserEvent.defaultPrevented && event.browserEvent.key !== "Escape") return;
         if (!this.alive || !editor.hasTextFocus()) return;
         try {
           if (event.browserEvent.key !== "Escape" && this.options.shouldHandleKey?.(event.browserEvent, this.mode) === false) return;
-          if (!this.key(event.browserEvent)) return;
+          const token = keyFromEvent(event.browserEvent);
+          if (!token || !this.routeKey(token, event.browserEvent)) return;
         } catch (error) { this.ui.error(error); }
         event.preventDefault();
         event.stopPropagation();
@@ -91,6 +112,12 @@ export class HelixController implements monaco.IDisposable {
         else if (this.alive) this.normalize();
       }),
     );
+    const root = editor.getDomNode();
+    if (root) {
+      const flush = () => { if (this.mode === "insert") this.clearKeyPrefix(true); };
+      root.addEventListener("compositionstart", flush, true);
+      this.subscriptions.push({ dispose: () => root.removeEventListener("compositionstart", flush, true) });
+    }
     this.setMode("normal");
     this.normalize();
   }
@@ -164,7 +191,11 @@ export class HelixController implements monaco.IDisposable {
     }));
   }
 
-  private status() { if (this.alive) this.ui.mode(this.mode, this.count + this.pending); }
+  private status() {
+    if (!this.alive) return;
+    this.ui.mode(this.mode, this.count + this.pending + encodeKeys(this.keyPrefix));
+    this.ui.hints?.(this.keymapHints());
+  }
 
   private writable() {
     if (!this.alive) return false;
@@ -299,6 +330,7 @@ export class HelixController implements monaco.IDisposable {
   }
 
   private leaveInsert(record = true) {
+    this.clearKeyPrefix(true);
     if (record && this.insertChanged) {
       this.lastInsert = { entry: this.insertEntry, texts: this.insertMarks.getRanges().map(range => this.model.getValueInRange(range)) };
     }
@@ -464,12 +496,225 @@ export class HelixController implements monaco.IDisposable {
   }
 
   execute(command: string, args: CommandArguments = {}, signal?: AbortSignal): Promise<void> {
+    if (command.startsWith(":")) return this.execute("host_command", { ...args, command: command.slice(1) }, signal);
     return this.dispatcher.execute(command, { ...args, count: Math.max(1, Math.min(10000, Number(args.count) || 1)) }, signal);
   }
   listCommands(): CommandInfo[] { return this.dispatcher.list(); }
-  cancel(): void { this.revision++; this.dispatcher.cancel(); this.pending = this.count = ""; this.status(); }
+  setKeymap(keymap: Keymaps): KeymapUpdate {
+    const result = this.keymap.replace(keymap);
+    if (result.ok) {
+      this.clearKeyPrefix(true);
+      this.options.keymap = keymap;
+      this.cancel();
+    }
+    return result;
+  }
+  /** Feed logical Helix tokens, using Monaco's supported typing commands in Insert. */
+  async feedKey(key: string, signal?: AbortSignal): Promise<void> {
+    if (!this.alive || signal?.aborted) throw new DOMException("Key input cancelled", "AbortError");
+    const token = normalizeKey(key);
+    const previous = this.commandWork;
+    const handled = this.routeKey(token, undefined, signal);
+    if (!handled && this.mode === "insert") this.insertUnbound(token);
+    if (this.commandWork !== previous) await this.commandWork;
+    await this.dispatcher.idle();
+    if (!this.alive || signal?.aborted) throw new DOMException("Key input cancelled", "AbortError");
+  }
+  async feedKeys(keys: string, signal?: AbortSignal): Promise<void> {
+    for (const key of decodeKeys(keys)) await this.feedKey(key, signal);
+  }
+  keymapHints(): KeyHint[] {
+    const result = this.keymap.lookup(this.mode, this.keyPrefix);
+    if (result.kind !== "pending") return [];
+    const commands = new Map(this.listCommands().map(command => [command.id, command]));
+    return result.next.map(key => {
+      const binding = this.keymap.lookup(this.mode, [...this.keyPrefix, key]);
+      if (binding.kind === "commands") {
+        const id = binding.commands.join(", ");
+        return { key, command: id, description: commands.get(binding.commands[0])?.description };
+      }
+      return { key, description: binding.kind === "pending" ? "More keys" : binding.kind === "macro" ? "Key macro" : binding.kind === "pass" ? "Pass through" : "Unbound" };
+    });
+  }
+  cancel(): void {
+    this.revision++;
+    this.clearKeyPrefix(false);
+    this.continuation = undefined;
+    this.dispatcher.cancel();
+    this.pending = this.count = "";
+    this.status();
+  }
   private dispatch(command: string, args: CommandArguments = {}): void {
-    void this.execute(command, args).catch(error => { if (this.alive && !isCancellation(error)) this.ui.error(error); });
+    this.commandWork = this.execute(command, args);
+    void this.commandWork.catch(error => { if (this.alive && !isCancellation(error)) this.ui.error(error); });
+  }
+
+  private clearKeyPrefix(flush: boolean): void {
+    if (this.prefixTimer !== undefined) clearTimeout(this.prefixTimer);
+    this.prefixTimer = undefined;
+    const keys = this.keyPrefix;
+    const insert = this.prefixMode === "insert";
+    this.keyPrefix = [];
+    this.prefixMode = undefined;
+    if (flush && insert && this.alive && this.mode === "insert") for (const key of keys) this.insertUnbound(key);
+  }
+
+  private insertUnbound(key: string): void {
+    if (!this.writable()) return;
+    const input: Record<string, string> = { space: " ", ret: this.model.getEOL() };
+    const actions: Record<string, string> = {
+      tab: "tab", "S-tab": "outdent", backspace: "deleteLeft", del: "deleteRight",
+      left: "cursorLeft", right: "cursorRight", up: "cursorUp", down: "cursorDown",
+      home: "cursorHome", end: "cursorEnd", pageup: "cursorPageUp", pagedown: "cursorPageDown",
+      "C-backspace": "deleteWordLeft", "A-backspace": "deleteWordLeft", "C-del": "deleteWordRight",
+    };
+    if (actions[key]) { this.action(actions[key]); return; }
+    const text = input[key] ?? (nextChar(key, 0) === key.length && !key.includes("\n") ? key : undefined);
+    if (text !== undefined) this.editor.trigger("helix", "type", { text });
+  }
+
+  private logicalEvent(token: string): KeyEventLike & { code: string; ctrlKey: boolean; altKey: boolean; shiftKey: boolean; metaKey: boolean } {
+    let value = token;
+    const modifiers = new Set<string>();
+    for (;;) {
+      const separator = value.indexOf("-");
+      const prefix = value.slice(0, separator);
+      if (separator < 0 || !["C", "A", "S", "Cmd"].includes(prefix)) break;
+      modifiers.add(prefix);
+      value = value.slice(separator + 1);
+    }
+    const names: Record<string, string> = { esc: "Escape", ret: "Enter", space: " ", tab: "Tab", backspace: "Backspace", del: "Delete", ins: "Insert", left: "ArrowLeft", right: "ArrowRight", up: "ArrowUp", down: "ArrowDown", home: "Home", end: "End", pageup: "PageUp", pagedown: "PageDown", minus: "-" };
+    let key = names[value] ?? (/^f\d+$/.test(value) ? value.toUpperCase() : value);
+    if (modifiers.has("S") && /^[a-z]$/.test(key)) key = key.toUpperCase();
+    const codes: Record<string, string> = { ";": "Semicolon", ":": "Semicolon", ".": "Period", "-": "Minus", "_": "Minus" };
+    return {
+      key, code: /^[a-z]$/i.test(key) ? `Key${key.toUpperCase()}` : codes[key] ?? key,
+      ctrlKey: modifiers.has("C"), altKey: modifiers.has("A"), shiftKey: modifiers.has("S") || /^[A-Z]$/.test(key) || key === "_" || key === ":",
+      metaKey: modifiers.has("Cmd"),
+    };
+  }
+
+  private routeKey(token: string, event?: KeyboardEvent, signal?: AbortSignal): boolean {
+    const logical = this.logicalEvent(token);
+    if (token === "esc" || token === "C-[") {
+      this.clearKeyPrefix(true);
+      this.continuation = undefined;
+      return this.keyLegacy(logical);
+    }
+    if (this.pending) {
+      const handled = this.keyLegacy(event ?? logical);
+      if (!this.pending && this.continuation) {
+        const continuation = this.continuation;
+        this.continuation = undefined;
+        this.track(this.commandWork.then(() => this.runCommands(continuation.commands, continuation.count, continuation.signal)));
+      }
+      return handled;
+    }
+    if (this.prefixMode && this.prefixMode !== this.mode) this.clearKeyPrefix(false);
+    const sequence = [...this.keyPrefix, token];
+    const match = this.keymap.lookup(this.mode, sequence);
+    if (match.kind === "pending") {
+      this.keyPrefix = sequence;
+      this.prefixMode = this.mode;
+      if (this.prefixTimer !== undefined) clearTimeout(this.prefixTimer);
+      if (this.mode === "insert") this.prefixTimer = setTimeout(() => {
+        this.clearKeyPrefix(true);
+        this.status();
+      }, this.options.chordTimeoutMs ?? 500);
+      this.status();
+      return true;
+    }
+    if (match.kind === "unbound" && !match.explicit && this.keyPrefix.length) {
+      const insert = this.prefixMode === "insert";
+      this.clearKeyPrefix(insert);
+      this.status();
+      return insert ? this.routeKey(token, event, signal) : true;
+    }
+    this.clearKeyPrefix(false);
+    if (match.kind === "pass") return false;
+    if (match.kind === "unbound") {
+      if (match.explicit) return this.mode !== "insert";
+      return this.keyLegacy(event ?? logical);
+    }
+    const count = Math.max(1, Number(this.count) || 1);
+    this.count = "";
+    if (match.kind === "commands") {
+      if (event && ["normal_mode", "select_mode", "insert_mode", "append_mode", "insert_at_line_start", "insert_at_line_end", "open_below", "open_above", "change_selection", "change_selection_noyank"].includes(match.commands[0])) {
+        this.revision++;
+        this.dispatcher.cancel();
+      }
+      this.track(this.runCommands(match.commands, count, signal));
+    }
+    else this.track(this.runKeyMacro(match.keys, signal));
+    this.status();
+    return true;
+  }
+
+  private track(work: Promise<void>): void {
+    this.commandWork = work;
+    void work.catch(error => { if (this.alive && !isCancellation(error)) this.ui.error(error); });
+  }
+
+  private async runCommands(commands: readonly string[], count: number, signal?: AbortSignal): Promise<void> {
+    for (let index = 0; index < commands.length; index++) {
+      if (!this.alive || signal?.aborted) throw new DOMException("Command sequence cancelled", "AbortError");
+      await this.execute(commands[index], { count }, signal);
+      if (this.pending && index < commands.length - 1) {
+        this.continuation = { commands: commands.slice(index + 1), count, signal };
+        return;
+      }
+    }
+  }
+
+  private async runKeyMacro(keys: readonly string[], signal?: AbortSignal): Promise<void> {
+    if (this.keyMacroDepth >= 32) throw new Error("Key macro recursion exceeds 32 levels");
+    const outer = this.keyMacroDepth++ === 0;
+    if (outer) this.keyMacroSteps = 0;
+    try {
+      for (const key of keys) {
+        if (++this.keyMacroSteps > 100_000) throw new Error("Key macro playback exceeds 100000 keys");
+        if (this.keyMacroSteps % 128 === 0) await new Promise<void>(resolve => setTimeout(resolve, 0));
+        await this.feedKey(key, signal);
+      }
+    } finally { this.keyMacroDepth--; }
+  }
+
+  private defaultKeymap(): Keymaps {
+    const normal: KeymapTree = {};
+    const assign = (keys: string[], command: string) => {
+      let current = normal;
+      for (const key of keys.slice(0, -1)) {
+        const branch = current[key];
+        if (!branch || typeof branch !== "object" || Array.isArray(branch)) current[key] = {};
+        current = current[key] as KeymapTree;
+      }
+      current[keys[keys.length - 1]] = command;
+    };
+    for (const command of this.listCommands()) for (const label of command.keys ?? []) {
+      let keys: string[];
+      if (label.startsWith("Space ")) keys = ["space", ...decodeKeys(label.slice(6))];
+      else {
+        try { keys = [normalizeKey(label)]; }
+        catch { keys = decodeKeys(label); }
+      }
+      assign(keys, command.id);
+    }
+    const aliases: Record<string, string> = {
+      left: "move_char_left", right: "move_char_right", down: "move_visual_line_down", up: "move_visual_line_up",
+      "C-z": "undo", "C-S-z": "redo", "C-c": "toggle_comments", "C-b": "page_up", "C-f": "page_down",
+      "C-u": "page_cursor_half_up", "C-d": "page_cursor_half_down", pageup: "page_up", pagedown: "page_down",
+      "A-s": "split_selection_on_newline", "A-.": "repeat_last_motion",
+      "(": "rotate_selections_backward", ")": "rotate_selections_forward", C: "copy_selection_on_next_line",
+      ".": "repeat_insert", "~": "switch_case", "`": "switch_to_lowercase", _: "trim_selections",
+      ">": "indent", "<": "unindent", "=": "format_selections", J: "join_selections",
+      "/": "search", "?": "rsearch", "*": "search_selection_detect_word_boundaries", ":": "command_mode",
+      r: "replace", G: "goto_line", '"': "select_register", esc: "normal_mode",
+    };
+    for (const [key, command] of Object.entries(aliases)) assign([normalizeKey(key)], command);
+    for (const [key, command] of Object.entries({ h: "goto_line_start", l: "goto_line_end" })) assign(["g", key], command);
+    for (const [key, command] of Object.entries({ i: "select_textobject_inner", a: "select_textobject_around", s: "surround_add", d: "surround_delete", r: "surround_replace", m: "match_brackets" })) assign(["m", key], command);
+    for (const [key, command] of Object.entries({ y: "yank_to_clipboard", p: "paste_clipboard_after", P: "paste_clipboard_before", k: "hover", r: "rename_symbol", a: "code_action" })) assign(["space", key], command);
+    return { normal, select: normal, insert: { esc: "normal_mode" } };
   }
   private registerCommands(): void {
     const add = (id: string, description: string, run: (args: CommandArguments) => void | Promise<void>, mutates = false, keys: string[] = []) =>
@@ -478,14 +723,23 @@ export class HelixController implements monaco.IDisposable {
       add(id, id.replaceAll("_", " "), args => this.move(key, args.count!), false, [key]);
     for (const [id, key] of Object.entries({ insert_mode: "i", append_mode: "a", insert_at_line_start: "I", insert_at_line_end: "A", open_below: "o", open_above: "O", change_selection: "c" }))
       add(id, id.replaceAll("_", " "), () => this.enterInsert(key), true, [key]);
-    add("normal_mode", "Return to Normal", () => { if (this.mode === "insert") this.leaveInsert(); else this.setMode("normal"); });
-    add("select_mode", "Extend selections", () => this.setMode(this.mode === "select" ? "normal" : "select"), false, ["v"]);
+    add("normal_mode", "Return to Normal", () => {
+      if (this.mode === "insert") this.leaveInsert(); else this.setMode("normal");
+      this.pending = this.count = "";
+    });
+    add("select_mode", "Extend selections", () => {
+      if (this.mode === "insert") this.leaveInsert();
+      this.setMode(this.mode === "select" ? "normal" : "select");
+    }, false, ["v"]);
     add("delete_selection", "Delete and yank selections", () => { this.yank(); this.replace([""]); }, true, ["d"]);
     add("yank", "Yank selections", () => { this.yank(); return this.clipboardWork; }, false, ["y"]);
     add("paste_after", "Paste after selections", args => this.paste(false, false, args.count), true, ["p"]);
     add("paste_before", "Paste before selections", args => this.paste(true, false, args.count), true, ["P"]);
     add("replace_with_yanked", "Replace with register", args => this.paste(false, true, args.count), true, ["R"]);
-    add("select_register", "Choose register", args => { this.register = String(args.character ?? '"'); });
+    add("select_register", "Choose register", args => {
+      if (args.character === undefined) this.awaitCharacter('"', args.count!);
+      else this.register = String(args.character);
+    });
     add("yank_to_clipboard", "Yank to clipboard", () => { this.register = "+"; this.yank(); return this.clipboardWork; }, false, ["Space y"]);
     add("paste_clipboard_after", "Paste clipboard after", args => { this.register = "+"; return this.paste(false, false, args.count); }, true, ["Space p"]);
     add("paste_clipboard_before", "Paste clipboard before", args => { this.register = "+"; return this.paste(true, false, args.count); }, true, ["Space P"]);
@@ -500,9 +754,18 @@ export class HelixController implements monaco.IDisposable {
     for (const [id, key] of Object.entries({ goto_file_start: "g", goto_last_line: "e", goto_first_nonwhitespace: "s", goto_column: "|", goto_definition: "d", goto_type_definition: "y", goto_reference: "r", goto_implementation: "i" }))
       add(id, id.replaceAll("_", " "), args => this.goto(key, args.count!), false, ["g" + key]);
     for (const [id, key] of Object.entries({ find_next_char: "f", find_till_char: "t", find_prev_char: "F", till_prev_char: "T" }))
-      add(id, id.replaceAll("_", " "), args => this.find(key, String(args.character ?? ""), args.count!), false, [key]);
-    add("select_textobject_inner", "Select inside object", args => this.select(this.ranges().map(range => textObject(this.text, range, String(args.character), false) ?? range)));
-    add("select_textobject_around", "Select around object", args => this.select(this.ranges().map(range => textObject(this.text, range, String(args.character), true) ?? range)));
+      add(id, id.replaceAll("_", " "), args => {
+        if (args.character === undefined) this.awaitCharacter(key, args.count!);
+        else this.find(key, String(args.character), args.count!);
+      }, false, [key]);
+    add("select_textobject_inner", "Select inside object", args => {
+      if (args.character === undefined) this.awaitCharacter("mi", args.count!);
+      else this.select(this.ranges().map(range => textObject(this.text, range, String(args.character), false) ?? range));
+    });
+    add("select_textobject_around", "Select around object", args => {
+      if (args.character === undefined) this.awaitCharacter("ma", args.count!);
+      else this.select(this.ranges().map(range => textObject(this.text, range, String(args.character), true) ?? range));
+    });
     add("search_next", "Next search match", args => this.search(false, args.count), false, ["n"]);
     add("search_prev", "Previous search match", args => this.search(true, args.count), false, ["N"]);
     add("select_regex", "Select regex matches", () => this.regexPrompt("s"), false, ["s"]);
@@ -515,8 +778,15 @@ export class HelixController implements monaco.IDisposable {
     add("no_op", "Do nothing", () => {});
     add("delete_selection_noyank", "Delete without yanking", () => this.replace([""]), true, ["Alt-d"]);
     add("change_selection_noyank", "Change without yanking", () => this.enterInsert("c", false), true, ["Alt-c"]);
-    add("surround_delete", "Remove surround", args => this.edit(surroundEdits(this.text, this.ranges(), String(args.character))), true, ["md"]);
-    add("surround_replace", "Replace surround", args => this.edit(surroundEdits(this.text, this.ranges(), String(args.character), String(args.replacement))), true, ["mr"]);
+    add("surround_delete", "Remove surround", args => {
+      if (args.character === undefined) this.awaitCharacter("md", args.count!);
+      else this.edit(surroundEdits(this.text, this.ranges(), String(args.character)));
+    }, true, ["md"]);
+    add("surround_replace", "Replace surround", args => {
+      if (args.character === undefined) this.awaitCharacter("mr", args.count!);
+      else if (args.replacement === undefined) this.awaitCharacter("mr" + String(args.character), args.count!);
+      else this.edit(surroundEdits(this.text, this.ranges(), String(args.character), String(args.replacement)));
+    }, true, ["mr"]);
     add("merge_selections", "Merge selections", () => this.select(mergeSelections(this.ranges())), false, ["Alt-minus"]);
     add("merge_consecutive_selections", "Merge adjacent selections", () => this.select(mergeConsecutiveSelections(this.ranges())), false, ["Alt-_"]);
     add("remove_selections", "Remove regex matches", () => this.regexPrompt("Alt-K"), false, ["Alt-K"]);
@@ -527,9 +797,94 @@ export class HelixController implements monaco.IDisposable {
         return [{anchor:this.model.getOffsetAt({lineNumber:a.lineNumber-1,column:a.column}),head:this.model.getOffsetAt({lineNumber:b.lineNumber-1,column:b.column})}];
       })]);
     }, false, ["Alt-C"]);
+    add("copy_selection_on_next_line", "Add selection below", () => {
+      this.select([...this.ranges(), ...this.ranges().flatMap(range => {
+        const [start, end] = selectionBounds(range);
+        const a = this.model.getPositionAt(start), b = this.model.getPositionAt(end);
+        if (b.lineNumber >= this.model.getLineCount()) return [];
+        return [{ anchor: this.model.getOffsetAt({ lineNumber: a.lineNumber + 1, column: a.column }), head: this.model.getOffsetAt({ lineNumber: b.lineNumber + 1, column: b.column }) }];
+      })]);
+    });
+    add("rotate_selections_backward", "Previous primary selection", () => {
+      const ranges = this.ranges();
+      if (ranges.length) this.select([ranges[ranges.length - 1], ...ranges.slice(0, -1)]);
+    });
+    add("rotate_selections_forward", "Next primary selection", () => {
+      const ranges = this.ranges();
+      if (ranges.length) this.select([...ranges.slice(1), ranges[0]]);
+    });
+    add("split_selection_on_newline", "Split selections into lines", () => this.select(regexSelections(this.text, this.ranges(), "\\r?\\n", true)));
+    add("repeat_last_motion", "Repeat the last character find", () => { if (this.lastFind) this.find(this.lastFind.command, this.lastFind.character, 1); });
+    add("page_cursor_half_up", "Move half a page up", () => this.move("k", Math.max(1, Math.floor(this.editor.getLayoutInfo().height / this.editor.getOption(monaco.editor.EditorOption.lineHeight) / 2))));
+    add("page_cursor_half_down", "Move half a page down", () => this.move("j", Math.max(1, Math.floor(this.editor.getLayoutInfo().height / this.editor.getOption(monaco.editor.EditorOption.lineHeight) / 2))));
+    add("goto_line", "Go to line number", args => this.goto("g", args.count!));
+    add("replace", "Replace selected characters", args => {
+      if (args.character === undefined) this.awaitCharacter("r", args.count!);
+      else this.replaceCharacters(String(args.character));
+    }, true);
+    add("surround_add", "Surround selections", args => {
+      if (args.character === undefined) this.awaitCharacter("ms", args.count!);
+      else this.addSurround(String(args.character));
+    }, true);
+    add("repeat_insert", "Repeat last insertion", args => {
+      if (!this.lastInsert) return;
+      const last = this.lastInsert;
+      for (let n = 0; n < args.count! && this.alive; n++) {
+        this.enterInsert(last.entry);
+        this.replace(last.texts, false);
+        this.leaveInsert(false);
+      }
+    }, true);
+    add("switch_case", "Toggle selection case", () => this.replace(this.ranges().map(range => {
+      const [start, end] = selectionBounds(range);
+      return [...this.text.slice(start, end)].map(char => char === char.toUpperCase() ? char.toLowerCase() : char.toUpperCase()).join("");
+    })), true);
+    add("switch_to_lowercase", "Lowercase selections", () => this.replace(this.ranges().map(range => this.text.slice(...selectionBounds(range)).toLowerCase())), true);
+    add("trim_selections", "Trim selection whitespace", () => this.select(this.ranges().map(range => {
+      const [start, end] = selectionBounds(range);
+      const value = this.text.slice(start, end);
+      return value.trim() ? { anchor: start + value.length - value.trimStart().length, head: end - (value.length - value.trimEnd().length) } : range;
+    })));
+    for (const [id, backwards] of [["search", false], ["rsearch", true]] as const) add(id, "Search regular expression", args => {
+      this.ui.prompt(backwards ? "?" : "/", pattern => {
+        if (pattern) this.session.searchPattern = pattern;
+        this.search(backwards, args.count);
+      });
+    });
+    add("search_selection_detect_word_boundaries", "Search for the primary selection", () => {
+      const range = this.ranges()[0];
+      if (!range) return;
+      const [start, end] = selectionBounds(range);
+      this.session.searchPattern = this.text.slice(start, end).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (/\w/.test(this.text[start] ?? "") && !/\w/.test(this.text[start - 1] ?? "")) this.session.searchPattern = "\\b" + this.session.searchPattern;
+      if (/\w/.test(this.text[end - 1] ?? "") && !/\w/.test(this.text[end] ?? "")) this.session.searchPattern += "\\b";
+    });
+    add("command_mode", "Open command prompt", () => this.ui.prompt(":", value => this.ui.command(value)));
+    add("host_command", "Run a host application command", args => this.ui.command(String(args.command ?? "")));
   }
 
-  private key(event: KeyboardEvent): boolean {
+  private awaitCharacter(prefix: string, count: number): void {
+    this.pending = prefix;
+    this.count = count > 1 ? String(count) : "";
+    this.status();
+  }
+
+  private replaceCharacters(character: string): void {
+    if (!this.writable()) return;
+    this.replace(this.ranges().map(range => {
+      const [start, end] = selectionBounds(range);
+      return Array.from(new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(this.text.slice(start, end)))
+        .map(part => /\r?\n/.test(part.segment) ? part.segment : character === "Enter" ? this.model.getEOL() : character).join("");
+    }));
+  }
+
+  private addSurround(character: string): void {
+    if (!this.writable()) return;
+    const close = ({ "(": ")", "[": "]", "{": "}", "<": ">" } as Record<string, string>)[character] ?? character;
+    this.replace(this.ranges().map(range => character + this.text.slice(...selectionBounds(range)) + close));
+  }
+
+  private keyLegacy(event: Pick<KeyboardEvent, "key" | "code" | "ctrlKey" | "altKey" | "shiftKey" | "metaKey">): boolean {
     const key = event.key;
     if (event.metaKey || (event.ctrlKey && event.altKey)) return false;
     if (key === "Escape" || (event.ctrlKey && key === "[")) {
@@ -701,6 +1056,8 @@ export class HelixController implements monaco.IDisposable {
     if (this.alive && this.mode === "insert") this.editor.pushUndoStop();
     const ranges = restoreEditor && this.alive && this.mode !== "insert" ? this.ranges() : undefined;
     this.disposed = true;
+    this.clearKeyPrefix(false);
+    this.continuation = undefined;
     this.dispatcher.dispose();
     this.subscriptions.forEach(subscription => subscription.dispose());
     this.insertMarks.clear();

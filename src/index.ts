@@ -6,6 +6,8 @@
 import * as monaco from "monaco-editor";
 import { HelixController, createSession } from "./controller.js";
 import type { HelixBinding, HelixMode, HelixOptions, ModalUI } from "./types.js";
+export { KeymapEngine, normalizeKey, decodeKeys, encodeKeys } from "./keymap.js";
+export type { Keymaps, KeymapTree, KeymapUpdate, KeymapDiagnostic } from "./keymap.js";
 
 export type { CommandInfo, CommandArguments } from "./commands.js";
 export type { ClipboardAdapter, HelixBinding, HelixMode, HelixOptions } from "./types.js";
@@ -18,6 +20,7 @@ export function initHelixMode(
   statusElement?: HTMLElement,
   options: HelixOptions = {},
 ): HelixBinding {
+  options = { ...options };
   bindings.get(editor)?.dispose();
   const root = editor.getDomNode();
   if (!root) throw new Error("monaco-helix requires a mounted editor");
@@ -109,13 +112,8 @@ export function initHelixMode(
         editor.revealPositionInCenter({ lineNumber, column: 1 });
         return;
       }
-      if (!options.onCommand) { notify(`No handler for :${command}`); return; }
-      const current = generation;
-      try {
-        Promise.resolve(options.onCommand(command)).catch(error => {
-          if (generation === current) report(error);
-        });
-      } catch (error) { report(error); }
+      if (!options.onCommand) throw new Error(`No handler for :${command}`);
+      return Promise.resolve(options.onCommand(command));
     },
     prompt(prefix, submit, initial = "") {
       cancelPrompt?.();
@@ -142,7 +140,7 @@ export function initHelixMode(
         if (focus) editor.focus();
         if (disposed || generation !== current) return;
         if (accept) {
-          try { submit(value); } catch (error) { report(error); }
+          try { void Promise.resolve(submit(value)).catch(report); } catch (error) { report(error); }
         }
       };
       const keydown = (event: KeyboardEvent) => {
@@ -204,6 +202,12 @@ export function initHelixMode(
     execute: (id, args) => controller?.execute(id, args) ?? Promise.reject(new Error("No active model")),
     listCommands: () => controller?.listCommands() ?? [],
     cancel: () => { cancelPrompt?.(); controller?.cancel(); },
+    feedKeys: (keys) => controller?.feedKeys(keys) ?? Promise.reject(new Error("No active model")),
+    setKeymap(keymap) {
+      const result = controller?.setKeymap(keymap) ?? {ok:false,diagnostics:[{severity:"error" as const,code:"no_model",path:"",message:"No active model"}]};
+      if (result.ok) options.keymap = keymap;
+      return result;
+    },
     onDidChangeMode(listener) {
       if (!disposed) listeners.add(listener);
       return { dispose: () => { listeners.delete(listener); } };
