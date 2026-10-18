@@ -1,6 +1,6 @@
 {
   "name": "monaco-helix",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "description": "Selection-first Helix keybindings for the Monaco editor",
   "type": "module",
   "license": "MIT",

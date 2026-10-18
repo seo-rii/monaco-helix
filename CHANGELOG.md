@@ -1,7 +1,11 @@
 # Changelog
 
-## 0.2.0 — Configurable editing and optional syntax
+## 0.1.0 — Initial source release
 
+- Extract the Logos Helix controller and selection helpers into a standalone
+  TypeScript ESM package for Monaco Editor.
+- Provide `initHelixMode`, disposable status and prompt UI, mode events, and a
+  host callback for application commands.
 - Add a shared command registry, `execute`, `listCommands`, `feedKeys`, and
   cancellation that protects later edits from failed or stale asynchronous work.
 - Add surround removal/replacement, selection merging, inverse regex filters,
@@ -19,13 +23,6 @@
 - Ship pinned WASM assets with license notices and a hash manifest; validate the
   extracted package's exports, public types, and actual grammar parsing.
 - Expand unit and Chromium integration coverage and publish feature guides.
-
-## 0.1.0 — Initial source release
-
-- Extract the Logos Helix controller and selection helpers into a standalone
-  TypeScript ESM package for Monaco Editor.
-- Provide `initHelixMode`, disposable status and prompt UI, mode events, and a
-  host callback for application commands.
 - Correct grapheme and paragraph boundaries, regex selection overlap, and
   boundary word motions; isolate each editor's registers and search state.
 - Include a browser demo, selection unit tests, and Chromium integration tests.
