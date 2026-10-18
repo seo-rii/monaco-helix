@@ -37,6 +37,10 @@
     "./toml": {
       "types": "./dist/toml.d.ts",
       "import": "./dist/toml.js"
+    },
+    "./search": {
+      "types": "./dist/search.d.ts",
+      "import": "./dist/search.js"
     }
   },
   "files": [

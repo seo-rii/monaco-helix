@@ -5,12 +5,14 @@
  */
 import * as monaco from "monaco-editor";
 import { HelixController, createSession } from "./controller.js";
-import type { HelixBinding, HelixMode, HelixOptions, ModalUI } from "./types.js";
+import type { HelixBinding, HelixMode, HelixOptions, KeyHint, ModalUI } from "./types.js";
 export { KeymapEngine, normalizeKey, decodeKeys, encodeKeys } from "./keymap.js";
 export type { Keymaps, KeymapTree, KeymapUpdate, KeymapDiagnostic } from "./keymap.js";
 
 export type { CommandInfo, CommandArguments } from "./commands.js";
 export type { ClipboardAdapter, HelixBinding, HelixMode, HelixOptions } from "./types.js";
+export { createWorkerSearchEngine, findSearchMatches, SearchHistory, SearchPreviewSession } from "./search.js";
+export type { SearchConfiguration, SearchEngine, SearchOptions, SearchResult } from "./search.js";
 
 const bindings = new WeakMap<monaco.editor.IStandaloneCodeEditor, HelixBinding>();
 
@@ -41,6 +43,7 @@ export function initHelixMode(
   let constructing = 0;
   let initialNotification = false;
   let cancelPrompt: (() => void) | undefined;
+  let activePrompt: { prefix: string; finish: (accept: boolean, focus: boolean, value?: string) => Promise<void> } | undefined;
   let commandKeys = "";
   const node = document.createElement("div");
   node.className = "monaco-helix-status";
@@ -52,7 +55,16 @@ export function initHelixMode(
   message.dataset.role = "message";
   message.setAttribute("role", "status");
   message.setAttribute("aria-live", "polite");
-  node.append(label, content, message);
+  message.id = `monaco-helix-message-${editor.getId()}`;
+  const hints = document.createElement("div");
+  hints.className = "monaco-helix-hints";
+  hints.dataset.role = "key-hints";
+  hints.setAttribute("role", "region");
+  hints.setAttribute("aria-label", "Available Helix commands");
+  hints.hidden = true;
+  let hintItems: KeyHint[] = [];
+  const renderHints = () => { hints.hidden = !hintItems.length || !!activePrompt || !commandKeys; };
+  node.append(label, content, message, hints);
   const widget: monaco.editor.IOverlayWidget = {
     getId: () => `monaco-helix.${editor.getId()}`,
     getDomNode: () => node,
@@ -92,6 +104,7 @@ export function initHelixMode(
       node.dataset.mode = next;
       label.textContent = next.toUpperCase();
       if (!cancelPrompt) content.textContent = pending;
+      renderHints();
       syncInput();
       // A reset is also the initial notification for the attached model.
       if (changed || !controller) {
@@ -101,6 +114,35 @@ export function initHelixMode(
     },
     notify,
     error: report,
+    hints(items) {
+      hintItems = [...items];
+      const list = document.createElement("div");
+      list.setAttribute("role", "list");
+      for (const item of hintItems.slice(0, 100)) {
+        const row = document.createElement("div");
+        row.setAttribute("role", "listitem");
+        const key = document.createElement("kbd");
+        key.textContent = item.key;
+        const description = document.createElement("span");
+        description.textContent = item.description ?? item.command ?? "More commands";
+        row.append(key, description);
+        list.append(row);
+      }
+      if (hintItems.length > 100) {
+        const remaining = document.createElement("div");
+        remaining.textContent = `${hintItems.length - 100} more bindings`;
+        list.append(remaining);
+      }
+      hints.replaceChildren(list);
+      renderHints();
+    },
+    promptActive: () => !!activePrompt,
+    async submitPrompt(value, prefix, cancel = false) {
+      const prompt = activePrompt;
+      if (!prompt) throw new Error("No active Helix prompt");
+      if (prefix !== undefined && prefix !== prompt.prefix) throw new Error(`Expected ${prefix} prompt, got ${prompt.prefix}`);
+      await prompt.finish(!cancel, true, value);
+    },
     command(value) {
       const command = value.trim();
       if (!command) return;
@@ -115,7 +157,7 @@ export function initHelixMode(
       if (!options.onCommand) throw new Error(`No handler for :${command}`);
       return Promise.resolve(options.onCommand(command));
     },
-    prompt(prefix, submit, initial = "") {
+    prompt(prefix, submit, initial = "", config = {}) {
       cancelPrompt?.();
       notify("");
       const current = generation;
@@ -123,39 +165,98 @@ export function initHelixMode(
       input.type = "text";
       input.spellcheck = false;
       input.setAttribute("aria-label", prefix === ":" ? "Helix command" : `Helix ${prefix}`);
+      input.setAttribute("aria-describedby", message.id);
+      input.autocomplete = "off";
       input.value = initial;
       const prefixNode = document.createElement("span");
       prefixNode.textContent = prefix;
       content.replaceChildren(prefixNode, input);
       let finished = false;
-      const finish = (accept: boolean, focus: boolean) => {
+      let composing = false;
+      let previewTimer: ReturnType<typeof setTimeout> | undefined;
+      let previewController: AbortController | undefined;
+      const stopPreview = () => {
+        if (previewTimer !== undefined) clearTimeout(previewTimer);
+        previewTimer = undefined;
+        previewController?.abort();
+        previewController = undefined;
+      };
+      const fail = (error: unknown) => {
+        if (error instanceof Error && error.name === "AbortError") return;
+        if (!disposed && current === generation) report(error);
+      };
+      const preview = () => {
+        stopPreview();
+        if (!config.onChange || finished || composing) return;
+        previewTimer = setTimeout(() => {
+          previewTimer = undefined;
+          if (finished || composing || disposed || generation !== current) return;
+          const request = new AbortController();
+          previewController = request;
+          try {
+            void Promise.resolve(config.onChange!(input.value, request.signal)).catch(error => {
+              if (!request.signal.aborted && !finished) fail(error);
+            });
+          } catch (error) { if (!request.signal.aborted && !finished) fail(error); }
+        }, 100);
+      };
+      const finish = async (accept: boolean, focus: boolean, override?: string) => {
         if (finished) return;
         finished = true;
+        stopPreview();
         cancelPrompt = undefined;
+        activePrompt = undefined;
         input.removeEventListener("keydown", keydown);
         input.removeEventListener("blur", blur);
-        const value = input.value;
+        input.removeEventListener("input", change);
+        input.removeEventListener("compositionstart", compositionStart);
+        input.removeEventListener("compositionend", compositionEnd);
+        const value = override ?? input.value;
         content.textContent = commandKeys;
+        renderHints();
         if (disposed || generation !== current) return;
         if (focus) editor.focus();
         if (disposed || generation !== current) return;
+        ui.recordPrompt?.(value, prefix, !accept);
         if (accept) {
-          try { void Promise.resolve(submit(value)).catch(report); } catch (error) { report(error); }
-        }
+          config.history?.record(value);
+          await submit(value);
+        } else config.onCancel?.();
       };
       const keydown = (event: KeyboardEvent) => {
         event.stopPropagation();
-        if (event.isComposing) return;
+        if (event.isComposing || composing) return;
+        if ((event.key === "ArrowUp" || event.key === "ArrowDown") && config.history) {
+          event.preventDefault();
+          input.value = (event.key === "ArrowUp" ? config.history.previous(input.value) : config.history.next()) ?? "";
+          input.setSelectionRange(input.value.length, input.value.length);
+          preview();
+          return;
+        }
         if (event.key === "Escape" || event.key === "Enter") {
           event.preventDefault();
-          finish(event.key === "Enter", true);
+          void finish(event.key === "Enter", true).catch(fail);
         }
       };
-      const blur = () => finish(false, false);
-      cancelPrompt = () => finish(false, false);
+      const blur = () => { void finish(false, false).catch(fail); };
+      const change = (event: Event) => {
+        if (composing || (event as InputEvent).isComposing) return;
+        config.history?.reset();
+        preview();
+      };
+      const compositionStart = () => { composing = true; stopPreview(); };
+      const compositionEnd = () => { composing = false; preview(); };
+      activePrompt = { prefix, finish };
+      cancelPrompt = () => { void finish(false, false).catch(fail); };
+      config.history?.reset();
       input.addEventListener("keydown", keydown);
       input.addEventListener("blur", blur);
+      input.addEventListener("input", change);
+      input.addEventListener("compositionstart", compositionStart);
+      input.addEventListener("compositionend", compositionEnd);
+      renderHints();
       input.focus();
+      if (initial) preview();
     },
   };
 
@@ -177,6 +278,7 @@ export function initHelixMode(
     controller?.dispose();
     controller = undefined;
     notify("");
+    ui.hints?.([]);
     // Controllers are model-specific; pending promises cannot cross this boundary.
     let next: HelixController | undefined;
     constructing++;

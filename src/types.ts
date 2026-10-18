@@ -1,5 +1,6 @@
 import type { IDisposable } from "monaco-editor";
 import type { Keymaps, KeymapUpdate } from "./keymap.js";
+import type { SearchConfiguration } from "./search.js";
 
 export type HelixMode = "normal" | "insert" | "select";
 
@@ -15,6 +16,7 @@ export interface HelixOptions {
   keymap?: Keymaps;
   /** Time before an incomplete Insert shortcut is flushed as ordinary input. */
   chordTimeoutMs?: number;
+  search?: SearchConfiguration;
   /** Application commands such as :write and :quit are delegated to the host. */
   onCommand?: (command: string) => void | Promise<void>;
   /** Receive clipboard failures, rejected host commands and unexpected errors. */

@@ -10,12 +10,14 @@ import {
   type HelixSelection,
 } from "./selection.js";
 import { CommandDispatcher, isCancellation } from "./commands.js";
-import type { CommandArguments, CommandInfo } from "./commands.js";
+import type { CommandArguments, CommandContext, CommandInfo } from "./commands.js";
 import type { HelixOptions, HelixMode, ModalUI } from "./types.js";
 import { surroundEdits, mergeSelections, mergeConsecutiveSelections } from "./editing.js";
 import { decodeKeys, encodeKeys, KeymapEngine, KeymapError, keyFromEvent, normalizeKey } from "./keymap.js";
 import type { KeyBinding, KeyEventLike, Keymaps, KeymapTree, KeymapUpdate } from "./keymap.js";
 import type { KeyHint } from "./types.js";
+import { createSearchController } from "./search-controller.js";
+import { SearchHistory } from "./search.js";
 
 interface InsertHistory {
   before: number;
@@ -27,6 +29,7 @@ export function createSession() {
   return {
     registers: new Map<string, string[]>(),
     searchPattern: "",
+    searchHistory: new SearchHistory(),
     insertHistory: new WeakMap<monaco.editor.ITextModel, InsertHistory[]>(),
   };
 }
@@ -35,6 +38,7 @@ type Session = ReturnType<typeof createSession>;
 
 export class HelixController implements monaco.IDisposable {
   private dispatcher: CommandDispatcher;
+  private searchController: ReturnType<typeof createSearchController>;
   private keymap: KeymapEngine;
   private keyPrefix: string[] = [];
   private prefixMode: HelixMode | undefined;
@@ -83,6 +87,13 @@ export class HelixController implements monaco.IDisposable {
     this.keymap = new KeymapEngine(this.defaultKeymap(), { commands: this.listCommands().map(command => command.id) });
     const configured = this.keymap.replace(options.keymap ?? {});
     if (!configured.ok) throw new KeymapError(configured.diagnostics);
+    this.searchController = createSearchController(editor, ui, {
+      ranges: () => this.ranges(), select: ranges => this.select(ranges),
+      alive: () => this.alive, revision: () => this.revision,
+      selectMode: () => this.mode === "select",
+      getPattern: () => this.session.searchPattern,
+      setPattern: pattern => { this.session.searchPattern = pattern; },
+    }, options.search ?? {}, session.searchHistory);
     this.insertMarks = editor.createDecorationsCollection();
     this.cursorDecorations = editor.createDecorationsCollection();
     this.subscriptions.push(
@@ -435,25 +446,7 @@ export class HelixController implements monaco.IDisposable {
   }
 
   private search(backwards: boolean, count = 1) {
-    if (!this.session.searchPattern) return;
-    try {
-      const matches = regexSelections(this.text, [{ anchor: 0, head: this.text.length }], this.session.searchPattern, false);
-      if (!matches.length) { this.ui.notify("No matches"); return; }
-      const ranges = this.ranges();
-      const next = ranges.map(range => {
-        const cursor = cursorOf(this.text, range);
-        let index = matches.findIndex(match => match.anchor > cursor);
-        if (backwards) {
-          const start = selectionBounds(range)[0];
-          index = -1;
-          for (let n = 0; n < matches.length && matches[n].anchor < start; n++) index = n;
-        }
-        if (index < 0) index = backwards ? matches.length - 1 : 0;
-        index = ((index + (backwards ? -1 : 1) * (count - 1)) % matches.length + matches.length) % matches.length;
-        return matches[index];
-      });
-      this.select(this.mode === "select" ? [...ranges, ...next] : next);
-    } catch { this.ui.notify("Invalid regular expression"); }
+    return this.searchController.next(backwards, count);
   }
 
   private goto(key: string, count: number) {
@@ -476,23 +469,7 @@ export class HelixController implements monaco.IDisposable {
   }
 
   private regexPrompt(kind: string) {
-    this.ui.prompt(kind, pattern => {
-      try {
-        if (kind === "s" || kind === "S") {
-          const result = regexSelections(this.text, this.ranges(), pattern, kind === "S");
-          if (result.length) this.select(result);
-          else this.ui.notify("No matches");
-        } else {
-          const regex = new RegExp(pattern, "mu");
-          const result = this.ranges().filter(range => {
-            const [start, end] = selectionBounds(range);
-            return regex.test(this.text.slice(start, end)) !== (kind === "Alt-K");
-          });
-          if (result.length) this.select(result);
-          else this.ui.notify("No matches");
-        }
-      } catch { this.ui.notify("Invalid regular expression"); }
-    });
+    this.searchController.regex(kind === "Alt-K" ? "remove" : kind as "s" | "S" | "K");
   }
 
   execute(command: string, args: CommandArguments = {}, signal?: AbortSignal): Promise<void> {
@@ -524,6 +501,7 @@ export class HelixController implements monaco.IDisposable {
     for (const key of decodeKeys(keys)) await this.feedKey(key, signal);
   }
   keymapHints(): KeyHint[] {
+    if (!this.keyPrefix.length) return [];
     const result = this.keymap.lookup(this.mode, this.keyPrefix);
     if (result.kind !== "pending") return [];
     const commands = new Map(this.listCommands().map(command => [command.id, command]));
@@ -541,6 +519,7 @@ export class HelixController implements monaco.IDisposable {
     this.clearKeyPrefix(false);
     this.continuation = undefined;
     this.dispatcher.cancel();
+    this.searchController.cancel();
     this.pending = this.count = "";
     this.status();
   }
@@ -717,7 +696,7 @@ export class HelixController implements monaco.IDisposable {
     return { normal, select: normal, insert: { esc: "normal_mode" } };
   }
   private registerCommands(): void {
-    const add = (id: string, description: string, run: (args: CommandArguments) => void | Promise<void>, mutates = false, keys: string[] = []) =>
+    const add = (id: string, description: string, run: (args: CommandArguments, context: CommandContext) => void | Promise<void>, mutates = false, keys: string[] = []) =>
       this.dispatcher.register({ id, description, mutates, keys }, run);
     for (const [id, key] of Object.entries({ move_char_left: "h", move_char_right: "l", move_visual_line_down: "j", move_visual_line_up: "k", move_next_word_start: "w", move_prev_word_start: "b", move_next_word_end: "e", move_next_long_word_start: "W", move_prev_long_word_start: "B", move_next_long_word_end: "E", goto_line_start: "Home", goto_line_end: "End" }))
       add(id, id.replaceAll("_", " "), args => this.move(key, args.count!), false, [key]);
@@ -766,8 +745,8 @@ export class HelixController implements monaco.IDisposable {
       if (args.character === undefined) this.awaitCharacter("ma", args.count!);
       else this.select(this.ranges().map(range => textObject(this.text, range, String(args.character), true) ?? range));
     });
-    add("search_next", "Next search match", args => this.search(false, args.count), false, ["n"]);
-    add("search_prev", "Previous search match", args => this.search(true, args.count), false, ["N"]);
+    add("search_next", "Next search match", (args, context) => this.searchController.next(false, args.count, context.signal), false, ["n"]);
+    add("search_prev", "Previous search match", (args, context) => this.searchController.next(true, args.count, context.signal), false, ["N"]);
     add("select_regex", "Select regex matches", () => this.regexPrompt("s"), false, ["s"]);
     add("split_selection", "Split selections by regex", () => this.regexPrompt("S"), false, ["S"]);
     add("keep_selections", "Filter selections", () => this.regexPrompt("K"), false, ["K"]);
@@ -845,12 +824,7 @@ export class HelixController implements monaco.IDisposable {
       const value = this.text.slice(start, end);
       return value.trim() ? { anchor: start + value.length - value.trimStart().length, head: end - (value.length - value.trimEnd().length) } : range;
     })));
-    for (const [id, backwards] of [["search", false], ["rsearch", true]] as const) add(id, "Search regular expression", args => {
-      this.ui.prompt(backwards ? "?" : "/", pattern => {
-        if (pattern) this.session.searchPattern = pattern;
-        this.search(backwards, args.count);
-      });
-    });
+    for (const [id, backwards] of [["search", false], ["rsearch", true]] as const) add(id, "Search regular expression", args => this.searchController.open(backwards, args.count));
     add("search_selection_detect_word_boundaries", "Search for the primary selection", () => {
       const range = this.ranges()[0];
       if (!range) return;
@@ -891,6 +865,7 @@ export class HelixController implements monaco.IDisposable {
       // Escape cancels pending asynchronous work even when already in Normal.
       this.revision++;
       this.dispatcher.cancel();
+      this.searchController.cancel();
       if (this.mode === "insert") this.leaveInsert();
       else this.setMode("normal");
       this.pending = this.count = "";
@@ -1059,6 +1034,7 @@ export class HelixController implements monaco.IDisposable {
     this.clearKeyPrefix(false);
     this.continuation = undefined;
     this.dispatcher.dispose();
+    this.searchController.dispose();
     this.subscriptions.forEach(subscription => subscription.dispose());
     this.insertMarks.clear();
     this.cursorDecorations.clear();

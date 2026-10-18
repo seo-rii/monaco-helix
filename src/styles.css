@@ -7,6 +7,7 @@
   outline: 1px solid var(--vscode-editorCursor-foreground, #a6accd);
 }
 .monaco-helix-status {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 0.65em;
@@ -29,3 +30,27 @@
   border-bottom: 1px solid currentColor;
   outline: none;
 }
+.monaco-helix-hints {
+  position: absolute;
+  z-index: 20;
+  right: 0;
+  bottom: calc(100% + 4px);
+  min-width: 16em;
+  max-width: min(36em, 80vw);
+  max-height: min(24em, 50vh);
+  overflow: auto;
+  padding: 6px 10px;
+  border: 1px solid var(--vscode-editorWidget-border, #666);
+  border-radius: 3px;
+  box-shadow: 0 3px 12px #0005;
+  color: var(--vscode-editorWidget-foreground, #ddd);
+  background: var(--vscode-editorWidget-background, #252526);
+}
+.monaco-helix-hints[hidden] { display: none; }
+.monaco-helix-hints [role="listitem"] {
+  display: grid;
+  grid-template-columns: minmax(3em, max-content) 1fr;
+  gap: 1em;
+  align-items: baseline;
+}
+.monaco-helix-hints kbd { font: inherit; font-weight: 700; }
