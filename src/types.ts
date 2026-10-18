@@ -2,6 +2,8 @@ import type { IDisposable } from "monaco-editor";
 import type { Keymaps, KeymapUpdate } from "./keymap.js";
 import type { SearchConfiguration } from "./search.js";
 import type { MacroEngine } from "./macros.js";
+import type { HostAdapter } from "./navigation.js";
+import type { NavigationConfiguration } from "./host-controller.js";
 
 export type HelixMode = "normal" | "insert" | "select";
 
@@ -18,6 +20,8 @@ export interface HelixOptions {
   /** Time before an incomplete Insert shortcut is flushed as ordinary input. */
   chordTimeoutMs?: number;
   search?: SearchConfiguration;
+  host?: HostAdapter;
+  navigation?: NavigationConfiguration;
   /** Application commands such as :write and :quit are delegated to the host. */
   onCommand?: (command: string) => void | Promise<void>;
   /** Receive clipboard failures, rejected host commands and unexpected errors. */
@@ -39,6 +43,8 @@ export interface HelixBinding extends IDisposable {
 
 export interface KeyHint { key: string; command?: string; description?: string }
 export interface PromptOptions {
+  /** Internal pickers record a validated structured response themselves. */
+  record?: boolean;
   onChange?: (value: string, signal: AbortSignal) => void | Promise<void>;
   onCancel?: () => void;
   history?: {
@@ -55,6 +61,8 @@ export interface ModalUI {
   notify: (message: string) => void;
   prompt: (label: string, submit: (value: string) => void | Promise<void>, initial?: string, config?: PromptOptions) => void;
   command: (value: string) => void | Promise<void>;
+  hostCommand?: (command: string, args: import("./commands.js").CommandArguments, signal?: AbortSignal) => void | Promise<void>;
+  recordJump?: () => void;
   hints?: (items: KeyHint[]) => void;
   promptActive?: () => boolean;
   submitPrompt?: (value: string, prefix?: string, cancel?: boolean) => Promise<void>;

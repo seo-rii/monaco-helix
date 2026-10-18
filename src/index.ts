@@ -5,6 +5,8 @@
  */
 import * as monaco from "monaco-editor";
 import { HelixController, createSession } from "./controller.js";
+import { createHostController, HOST_COMMAND_IDS } from "./host-controller.js";
+import { createHostPicker } from "./picker.js";
 import type { HelixBinding, HelixMode, HelixOptions, KeyHint, ModalUI } from "./types.js";
 export { KeymapEngine, normalizeKey, decodeKeys, encodeKeys } from "./keymap.js";
 export type { Keymaps, KeymapTree, KeymapUpdate, KeymapDiagnostic } from "./keymap.js";
@@ -41,6 +43,7 @@ export function initHelixMode(
   let disposed = false;
   let mode: HelixMode = "normal";
   let controller: HelixController | undefined;
+  let hostController: ReturnType<typeof createHostController> | undefined;
   let generation = 0;
   let constructing = 0;
   let initialNotification = false;
@@ -98,6 +101,23 @@ export function initHelixMode(
       }
     }
   };
+  const runApplicationCommand = (value: string, signal?: AbortSignal): void | Promise<void> => {
+    const command = value.trim();
+    if (!command) return;
+    if (/^\d+$/.test(command)) {
+      const model = editor.getModel();
+      if (!model) return;
+      hostController?.record();
+      const lineNumber = Math.min(model.getLineCount(), Math.max(1, Number(command)));
+      editor.setPosition({ lineNumber, column: 1 });
+      editor.revealPositionInCenter({ lineNumber, column: 1 });
+      hostController?.record();
+      return;
+    }
+    if (options.onCommand) return Promise.resolve(options.onCommand(command));
+    if (options.host?.executeCommand) return hostController?.execute("host_command", { command }, signal);
+    throw new Error(`No handler for :${command}`);
+  };
   const ui: ModalUI = {
     mode(next, pending = "") {
       const changed = next !== mode;
@@ -116,6 +136,12 @@ export function initHelixMode(
     },
     notify,
     error: report,
+    hostCommand(id, args, signal) {
+      if (id === "host_command") return runApplicationCommand(String(args.command ?? ""), signal);
+      if (!hostController) throw new Error("Host navigation is not initialized");
+      return hostController.execute(id, args, signal);
+    },
+    recordJump: () => hostController?.record(),
     hints(items) {
       hintItems = [...items];
       const list = document.createElement("div");
@@ -145,20 +171,7 @@ export function initHelixMode(
       if (prefix !== undefined && prefix !== prompt.prefix) throw new Error(`Expected ${prefix} prompt, got ${prompt.prefix}`);
       await prompt.finish(!cancel, true, value);
     },
-    command(value) {
-      const command = value.trim();
-      if (!command) return;
-      if (/^\d+$/.test(command)) {
-        const model = editor.getModel();
-        if (!model) return;
-        const lineNumber = Math.min(model.getLineCount(), Math.max(1, Number(command)));
-        editor.setPosition({ lineNumber, column: 1 });
-        editor.revealPositionInCenter({ lineNumber, column: 1 });
-        return;
-      }
-      if (!options.onCommand) throw new Error(`No handler for :${command}`);
-      return Promise.resolve(options.onCommand(command));
-    },
+    command: value => runApplicationCommand(value),
     prompt(prefix, submit, initial = "", config = {}) {
       cancelPrompt?.();
       notify("");
@@ -219,7 +232,7 @@ export function initHelixMode(
         if (disposed || generation !== current) return;
         if (focus) editor.focus();
         if (disposed || generation !== current) return;
-        ui.recordPrompt?.(value, prefix, !accept);
+        if (config.record !== false) ui.recordPrompt?.(value, prefix, !accept);
         try {
           if (accept) {
             config.history?.record(value);
@@ -270,6 +283,9 @@ export function initHelixMode(
       if (initial) preview();
     },
   };
+  hostController = createHostController(editor, options.host ?? {}, {
+    pick: createHostPicker(ui, node, { isReplaying: () => session.macros.isPlaying }), notify,
+  }, options.navigation);
 
   // EditContext can bypass textarea readOnly. Keep Monaco's supported textarea
   // path while modal editing is active, including on a model attached later.
@@ -285,6 +301,7 @@ export function initHelixMode(
   const reset = () => {
     if (disposed) return;
     const current = ++generation;
+    hostController?.onModelChange();
     session.macros.cancel("model changed");
     session.macros.discard();
     cancelPrompt?.();
@@ -315,9 +332,16 @@ export function initHelixMode(
   const binding: HelixBinding = {
     macros: session.macros,
     getMode: () => mode,
-    execute: (id, args) => controller?.execute(id, args) ?? Promise.reject(new Error("No active model")),
+    execute(id, args) {
+      if (disposed) return Promise.reject(new DOMException("Binding disposed", "AbortError"));
+      if ((HOST_COMMAND_IDS as readonly string[]).includes(id)) {
+        try { return Promise.resolve(ui.hostCommand!(id, args ?? {})); }
+        catch (error) { return Promise.reject(error); }
+      }
+      return controller?.execute(id, args) ?? Promise.reject(new Error("No active model"));
+    },
     listCommands: () => controller?.listCommands() ?? [],
-    cancel: () => { cancelPrompt?.(); controller?.cancel(); },
+    cancel: () => { hostController?.cancel(); cancelPrompt?.(); controller?.cancel(); },
     feedKeys: (keys) => controller?.feedKeys(keys) ?? Promise.reject(new Error("No active model")),
     setKeymap(keymap) {
       const result = controller?.setKeymap(keymap) ?? {ok:false,diagnostics:[{severity:"error" as const,code:"no_model",path:"",message:"No active model"}]};
@@ -332,6 +356,7 @@ export function initHelixMode(
       if (disposed) return;
       disposed = true;
       session.macros.dispose();
+      hostController?.dispose();
       generation++;
       modelListener.dispose();
       configListener.dispose();

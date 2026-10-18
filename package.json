@@ -45,6 +45,10 @@
     "./macros": {
       "types": "./dist/macros.d.ts",
       "import": "./dist/macros.js"
+    },
+    "./navigation": {
+      "types": "./dist/navigation.d.ts",
+      "import": "./dist/navigation.js"
     }
   },
   "files": [

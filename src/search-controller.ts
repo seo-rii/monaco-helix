@@ -68,7 +68,7 @@ export function createSearchController(
   };
   const announce = (result: SearchResult) => ui.notify(result.matches.length
     ? `${result.matches.length}${result.truncated ? "+" : ""} matches` : "No matches");
-  const choose = (snapshot: Snapshot, result: SearchResult, backwards: boolean, count: number) => {
+  const choose = (snapshot: Snapshot, result: SearchResult, backwards: boolean, count: number, record = false) => {
     announce(result);
     if (!result.matches.length) { restore(snapshot); return; }
     const text = snapshot.model.getValue();
@@ -85,7 +85,9 @@ export function createSearchController(
       index = ((index + (backwards ? -1 : 1) * (amount - 1)) % result.matches.length + result.matches.length) % result.matches.length;
       return { ...result.matches[index]! };
     });
+    if (record) { restore(snapshot); ui.recordJump?.(); }
     access.select(access.selectMode() ? [...snapshot.ranges.map(range => ({ ...range })), ...found] : found);
+    if (record) ui.recordJump?.();
   };
   const transform = (snapshot: Snapshot, result: SearchResult, kind: RegexPromptKind): HelixSelection[] => {
     // Partial selection sets could cause a later edit to silently affect only some matches.
@@ -153,13 +155,13 @@ export function createSearchController(
       const snapshot = capture();
       startPrompt(backwards ? "?" : "/", snapshot,
         result => choose(snapshot, result, backwards, count),
-        (pattern, result) => { access.setPattern(pattern); choose(snapshot, result, backwards, count); });
+        (pattern, result) => { access.setPattern(pattern); choose(snapshot, result, backwards, count, true); });
     },
     async next(backwards: boolean, count = 1, signal?: AbortSignal): Promise<void> {
       const pattern = access.getPattern();
       if (!pattern) return;
       const snapshot = capture();
-      choose(snapshot, await matches(snapshot, pattern, false, [signal]), backwards, count);
+      choose(snapshot, await matches(snapshot, pattern, false, [signal]), backwards, count, true);
     },
     regex(kind: RegexPromptKind): void {
       const snapshot = capture();

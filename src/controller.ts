@@ -531,7 +531,8 @@ export class HelixController implements monaco.IDisposable {
     };
     if (actions[key]) { this.action(actions[key]); return; }
     if (!["g", "e", "h", "l", "s", "|"].includes(key)) return;
-    this.select(this.ranges().map(range => {
+    const source = this.ranges();
+    const destination = source.map(range => {
       let { lineNumber, column } = this.model.getPositionAt(cursorOf(this.text, range));
       if (key === "g") { lineNumber = Math.min(count, this.model.getLineCount()); column = 1; }
       if (key === "e") { lineNumber = this.model.getLineCount(); column = 1; }
@@ -540,7 +541,12 @@ export class HelixController implements monaco.IDisposable {
       if (key === "s") column = this.model.getLineFirstNonWhitespaceColumn(lineNumber) || 1;
       if (key === "|") column = count;
       return moveSelection(this.text, range, this.model.getOffsetAt({ lineNumber, column }), this.mode === "select");
-    }));
+    });
+    const jump = (key === "g" || key === "e") && destination.some((range, index) => range.anchor !== source[index].anchor || range.head !== source[index].head);
+    if (jump) this.ui.recordJump?.();
+    if (!this.alive) return;
+    this.select(destination);
+    if (jump && this.alive) this.ui.recordJump?.();
   }
 
   private regexPrompt(kind: string) {
@@ -892,7 +898,7 @@ export class HelixController implements monaco.IDisposable {
     const aliases: Record<string, string> = {
       left: "move_char_left", right: "move_char_right", down: "move_visual_line_down", up: "move_visual_line_up",
       "C-z": "undo", "C-S-z": "redo", "C-c": "toggle_comments", "C-b": "page_up", "C-f": "page_down",
-      "C-u": "page_cursor_half_up", "C-d": "page_cursor_half_down", pageup: "page_up", pagedown: "page_down",
+      "C-u": "page_cursor_half_up", "C-d": "page_cursor_half_down", "C-o": "jump_backward", "C-i": "jump_forward", pageup: "page_up", pagedown: "page_down",
       "A-s": "split_selection_on_newline", "A-.": "repeat_last_motion",
       "(": "rotate_selections_backward", ")": "rotate_selections_forward", C: "copy_selection_on_next_line",
       ".": "repeat_insert", "~": "switch_case", "`": "switch_to_lowercase", _: "trim_selections",
@@ -904,7 +910,7 @@ export class HelixController implements monaco.IDisposable {
     for (const [key, command] of Object.entries(aliases)) assign([normalizeKey(key)], command);
     for (const [key, command] of Object.entries({ h: "goto_line_start", l: "goto_line_end" })) assign(["g", key], command);
     for (const [key, command] of Object.entries({ i: "select_textobject_inner", a: "select_textobject_around", s: "surround_add", d: "surround_delete", r: "surround_replace", m: "match_brackets" })) assign(["m", key], command);
-    for (const [key, command] of Object.entries({ y: "yank_to_clipboard", p: "paste_clipboard_after", P: "paste_clipboard_before", k: "hover", r: "rename_symbol", a: "code_action" })) assign(["space", key], command);
+    for (const [key, command] of Object.entries({ y: "yank_to_clipboard", p: "paste_clipboard_after", P: "paste_clipboard_before", k: "hover", r: "rename_symbol", a: "code_action", f: "file_picker", b: "buffer_picker", s: "symbol_picker" })) assign(["space", key], command);
     return { normal, select: normal, insert: { esc: "normal_mode" } };
   }
   private registerCommands(): void {
@@ -1045,8 +1051,17 @@ export class HelixController implements monaco.IDisposable {
       if (/\w/.test(this.text[start] ?? "") && !/\w/.test(this.text[start - 1] ?? "")) this.session.searchPattern = "\\b" + this.session.searchPattern;
       if (/\w/.test(this.text[end - 1] ?? "") && !/\w/.test(this.text[end] ?? "")) this.session.searchPattern += "\\b";
     });
-    add("command_mode", "Open command prompt", () => this.ui.prompt(":", value => this.ui.command(value)));
-    add("host_command", "Run a host application command", args => this.ui.command(String(args.command ?? "")));
+    add("command_mode", "Open command prompt", () => this.ui.prompt(":", value => this.execute("host_command", { command: value }, this.macroContext?.signal)));
+    add("host_command", "Run a host application command", (args, context) => this.ui.hostCommand
+      ? this.ui.hostCommand("host_command", args, context.signal)
+      : this.ui.command(String(args.command ?? "")));
+    for (const [id, description] of Object.entries({
+      jump_backward: "Jump to the previous location", jump_forward: "Jump to the next location",
+      file_picker: "Open file picker", buffer_picker: "Open buffer picker", symbol_picker: "Open symbol picker",
+    })) add(id, description, (args, context) => {
+      if (!this.ui.hostCommand) throw new Error(`Host does not support ${id}`);
+      return this.ui.hostCommand(id, args, context.signal);
+    });
     add("record_macro", "Start or stop recording a macro", args => {
       if (this.session.macros.isPlaying) throw new Error("Cannot change macro recording during playback");
       if (this.session.macros.isRecording) this.session.macros.stop();
@@ -1237,7 +1252,7 @@ export class HelixController implements monaco.IDisposable {
       this.session.searchPattern = this.text.slice(start, end).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       if (/\w/.test(this.text[start] ?? "") && !/\w/.test(this.text[start - 1] ?? "")) this.session.searchPattern = "\\b" + this.session.searchPattern;
       if (/\w/.test(this.text[end - 1] ?? "") && !/\w/.test(this.text[end] ?? "")) this.session.searchPattern += "\\b";
-    } else if (key === ":") this.ui.prompt(":", value => this.ui.command(value));
+    } else if (key === ":") this.ui.prompt(":", value => this.execute("host_command", { command: value }, this.macroContext?.signal));
     else if (key === "G") this.goto("g", count);
     else if (key === "PageUp" || key === "PageDown") this.action(key === "PageUp" ? "cursorPageUp" : "cursorPageDown");
     // In normal/select mode all unbound text keys are consumed. They must never

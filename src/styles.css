@@ -54,3 +54,25 @@
   align-items: baseline;
 }
 .monaco-helix-hints kbd { font: inherit; font-weight: 700; }
+.monaco-helix-picker {
+  position: absolute;
+  z-index: 20;
+  right: 0;
+  bottom: calc(100% + 4px);
+  min-width: min(24em, 75vw);
+  max-width: min(42em, 80vw);
+  max-height: min(26em, 50vh);
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--vscode-editorWidget-border, #666);
+  border-radius: 3px;
+  color: var(--vscode-editorWidget-foreground, #ddd);
+  background: var(--vscode-editorWidget-background, #252526);
+  box-shadow: 0 3px 12px #0005;
+}
+.monaco-helix-picker [role="option"] { padding: 4px 8px; cursor: pointer; }
+.monaco-helix-picker [aria-selected="true"] {
+  color: var(--vscode-list-activeSelectionForeground, #fff);
+  background: var(--vscode-list-activeSelectionBackground, #094771);
+}
+.monaco-helix-picker small { display: block; opacity: 0.75; }
