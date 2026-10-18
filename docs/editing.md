@@ -1,5 +1,19 @@
 # Surround and selection helpers
 
+Use command IDs through the binding's public API:
+
+```ts
+await binding.execute('surround_delete', { character: '(' });
+await binding.execute('surround_replace', { character: '(', replacement: '[' });
+await binding.execute('merge_consecutive_selections');
+```
+
+The default keys are `md` followed by a delimiter to remove a surround, `mr`
+followed by the existing and replacement delimiters to replace it, `A-minus` to
+merge all selections, and `A-_` to merge touching groups. Omitting a delimiter
+argument from `execute()` enters the corresponding pending character command.
+The contracts below document the pure helpers in `src/editing.ts` for maintainers.
+
 `surroundEdits(text, ranges, from, to?)` returns nonoverlapping, ascending
 `{ start, end, text }` edits in half-open UTF-16 offsets. Omit `to` to remove a
 surround; supply it to replace the surround. Apply the complete returned set in

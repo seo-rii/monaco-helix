@@ -39,24 +39,38 @@ a comprehensive audit of Logos or a claim of full Helix compatibility.
 | Prompt focus changes | Restoring focus before submitting a prompt can synchronously switch the model through host callbacks. The prompt now rechecks its generation after focus, so a stale command cannot target the replacement model. |
 | Input and cleanup | Normal and Select modes guard native input as well as modal key events. Insert mode keeps Monaco's input path. Disposal removes owned resources and restores the editor options changed by the binding. |
 | Reentrant disposal | Selection cleanup can invoke host cursor listeners that switch models or attach another binding. Disposal now marks the old binding inactive and detaches its listeners before cleanup, restores options before collapsing the selection, and preserves a newly attached binding. |
+| Command ordering | Keyboard, public API, and keymap commands share one dispatcher. Asynchronous failures cancel queued edits. Cancellation detaches the old request before a new command starts, so a late response cannot clear a newer queue. |
+| Configuration | Keymap replacements validate before installation. Nested overrides retain inherited prefix commands; incomplete Insert chords restore buffered text on timeout, mismatch, or composition start. |
+| Search responsiveness | Regexes execute in terminable Workers with document, pattern, result, and time limits. Preview transactions restore the original selection and viewport on cancellation, and selection transforms reject truncated results. |
+| Macro replay | Recordings distinguish logical keys, committed text, and prompt responses. Playback awaits asynchronous operations and uses shared recursion, step, cancellation, and model guards. |
+| Host ownership | File and workbench operations require explicit host capabilities. Navigation records successful locations, aborts superseded requests, and keeps file/model ownership in the application. |
+| Optional syntax | Parser work stays behind an optional provider and Worker entrypoint. Responses carry a document version and editor/model session ID, and stale, missing, or failed syntax selections cancel following edits. Runtime and grammar versions are pinned and shipped with licenses and hashes. |
+| Native input ordering | Accepted regex searches enter the command queue. Native key streams wait for asynchronous selection work and resolve their bindings in the resulting mode, so a queued change followed by typing applies to the new selection. Failure, cancellation, and model changes discard buffered input; host shortcuts pass through immediately. |
+| Initial configuration failure | If the initial controller rejects an invalid keymap or chord timeout, the wrapper disposes its partially attached binding and restores editor options and native input. |
 
 These changes are package-specific fixes and adaptations. They do not establish
 full equivalence with the native Helix editor.
 
 ## Validation
 
-The initial implementation has passed:
+The initial extraction passed 24 selection unit cases and 36 Chromium integration
+cases. The expanded suite additionally covers:
 
-- Selection unit tests: 24 passing cases, covering Unicode and CRLF boundaries,
-  directional selections, word and paragraph objects, regex selection, and
-  repeated movement through a long document.
-- Chromium integration tests: 36 passing cases against real Monaco, covering
-  keyboard routing, edit and undo behavior, search, read-only protection, model
-  changes, delayed clipboard work, reentrant callbacks, disposal, and the
-  browser playground.
-- `npm run typecheck`.
-- `npm run build`.
-- TypeScript consumer validation against the packed package.
+- Unicode and CRLF selection boundaries, directional ranges, text objects,
+  surround edits, merging, and repeated long-document movement.
+- Command cancellation, keymap validation, TOML imports, Worker regex limits,
+  preview restoration, macro recursion, and host navigation races.
+- Real Monaco keyboard/input routing, buffered native edits, undo, read-only
+  behavior, prompts, model changes, reentrant callbacks, and disposal.
+- Real Tree-sitter parsing, syntax selection order, version/language guards,
+  independent editor sessions, and built Worker/WASM URL resolution.
+- Type checking, a distribution build, and TypeScript consumers of the extracted
+  npm package without the optional runtime installed.
+- Shipped WASM hashes/licenses and actual parsing of extracted package assets.
+
+`npm run check` runs the unit, type, package, and Chromium gates. Browser coverage
+includes application-error collection rather than silently ignoring Worker
+failures. Feature guides describe the tested behavior and compatibility limits.
 
 ## Compatibility boundaries
 

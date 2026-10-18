@@ -21,10 +21,11 @@ Useful commands:
 | Command | Purpose |
 | --- | --- |
 | `npm run dev` | Run the browser demo locally |
-| `npm test` | Run the selection-helper unit tests |
+| `npm test` | Run command, selection, keymap, search, macro, navigation, and syntax unit tests |
 | `npm run test:browser` | Run Monaco integration tests in Chromium |
 | `npm run typecheck` | Check TypeScript types |
 | `npm run build` | Build the distributable package |
+| `npm run test:package` | Verify exports, assets, notices, and a typed consumer of the npm tarball |
 | `npm run check` | Run the project's validation checks |
 
 ## Changes and tests
@@ -35,6 +36,12 @@ Selection arithmetic belongs in the unit tests; keyboard routing, undo groups,
 model changes, disposal, and read-only behavior need browser coverage against
 real Monaco. Browser tests should send DOM keyboard events rather than call
 private controller methods.
+
+The optional syntax tests use the pinned Tree-sitter runtime and bundled grammar
+assets. Run `npm run build` before running browser tests directly, so the built
+Worker and WASM tests exercise the files consumers receive. `npm run check`
+performs this preparation automatically. Keep WASM license and hash manifest
+generation in the build when changing the parser assets.
 
 Check both forward and backward selections when changing selection behavior.
 Consider empty models, end of file, CRLF, combining marks, emoji, multiple

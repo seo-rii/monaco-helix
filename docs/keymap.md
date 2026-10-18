@@ -41,14 +41,19 @@ In Select mode, motions extend the current selections.
 | `Alt-;` | Reverse selection direction |
 | `_` | Trim whitespace from selections |
 | `C` | Add selections on the next line |
+| `Alt-C` | Add selections on the previous line |
+| `Alt-minus`, `Alt-_` | Merge all selections or merge overlapping and adjacent selections |
 | `,` | Keep only the primary selection |
 | `(`, `)` | Rotate the primary selection |
 | `s` | Select regex matches within the current selections |
 | `S` | Split current selections on a regex |
 | `K` | Keep selections matching a regex |
+| `Alt-K` | Remove selections matching a regex |
 | `Alt-s` | Split selections into lines |
 | `mi`, `ma` + object | Select inside or around a text object |
 | `ms` + character | Surround selections with the character or matching brackets |
+| `md` + character | Remove the enclosing pair |
+| `mr` + old + new | Replace the enclosing pair |
 | `mm` | Jump to the matching bracket through Monaco |
 
 Text objects include `w`, `W`, `p`, brackets, and quotes. Regex prompts use
@@ -61,6 +66,7 @@ JavaScript regular expressions, not Helix's regex engine. Submit a prompt with
 | --- | --- |
 | `d` | Yank and delete selections |
 | `c` | Change selections and enter Insert mode |
+| `Alt-d`, `Alt-c` | Delete or change without yanking |
 | `y` | Yank selections |
 | `p`, `P` | Paste after or before selections |
 | `R` | Replace selections with register contents |
@@ -73,6 +79,7 @@ JavaScript regular expressions, not Helix's regex engine. Submit a prompt with
 | `u`, `U` | Undo or redo |
 | `Ctrl-z`, `Ctrl-Shift-z` | Undo or redo |
 | `.` | Repeat the last insertion |
+| `Q`, `q` | Start/stop macro recording, or replay the selected macro register |
 | `>`, `<` | Indent or outdent selected lines |
 | `=` | Format selections through Monaco |
 | `J` | Join lines through Monaco |
@@ -94,16 +101,45 @@ navigation, selection, search, and yanking while rejecting edit commands.
 | `Space k` | Show hover |
 | `Space r` | Rename through Monaco |
 | `Space a` | Show quick fixes through Monaco |
+| `Ctrl-o`, `Ctrl-i` | Travel backward or forward through jump history |
+| `Space f`, `Space b`, `Space s` | Open the host file, buffer, or symbol picker |
 
 In Select mode, `n` and `N` add matches to the selections. Language-service
 commands require the corresponding Monaco providers. A numeric command such as
 `:42` goes to line 42. Other colon commands, such as `:w`, have no built-in
 filesystem behavior; connect `onCommand` to your host application.
 
+`"aQ` records to macro register `a`; `"aq` plays it. The default macro register
+is `@`. A count repeats the whole macro. See the [macro guide](macros.md) for
+committed text, prompt responses, cancellation, and export formats.
+
+## Optional syntax editing
+
+These bindings require `options.syntaxProvider`. The bundled Tree-sitter
+adapter supports Python, C++, and TypeScript; see the [syntax guide](syntax.md)
+for language-specific objects and deployment instructions.
+
+| Keys | Action |
+| --- | --- |
+| `mi`, `ma` + `f`, `t`, `a`, `c`, `T` | Select inside/around a function, type, argument, comment, or test |
+| `Alt-o`, `Alt-i` | Expand to a parent node or shrink the selection |
+| `Alt-p`, `Alt-n` | Select the previous or next sibling |
+| `Alt-a`, `Alt-I` | Select all siblings or children |
+| `Alt-b`, `Alt-e` | Move to the parent node's start or end |
+| `]`, `[` + `f`, `t`, `a`, `c`, `T` | Move to the next or previous syntax object |
+
+Alt-arrow aliases provide parent/child/previous-sibling/next-sibling selection.
+An unavailable syntax target or stale parser result cancels queued edits.
+
 ## Scope
 
-Helix configuration files, custom keymaps, macros, shell pipelines, tree-sitter
-syntax text objects, and window management are outside the current feature
-set. Registers and search behavior are implemented in JavaScript; this package
-does not embed the Helix editor. See the [review notes](review.md) for known
-limitations and validation scope.
+Override the mode-specific bindings with [custom keymaps](keymaps.md), including
+nested prefixes, command sequences, and imported Helix TOML key tables. The
+status UI shows the commands available after a prefix. The command registry
+returned by `listCommands()` describes the active implementation's commands.
+
+See the guides for [macros](macros.md), [host navigation](navigation.md), and
+[optional syntax objects](syntax.md). Shell pipelines and Helix plugins are
+outside this package. Registers and search behavior are implemented in
+JavaScript; this package does not embed the Helix editor. See the
+[review notes](review.md) for compatibility and validation scope.

@@ -24,7 +24,15 @@ const binding = initHelixMode(editor, status, {
 Nested overrides preserve other inherited prefix bindings. Replacing a prefix
 with a command removes its old descendants. Replacing a command with a nested
 table makes that key a prefix. An empty override set restores the defaults.
-An invalid replacement leaves the currently installed map intact.
+An invalid replacement leaves the currently installed map intact. Check the
+returned `{ ok, diagnostics }` result. A successful replacement cancels pending
+editor work and clears prefixes; buffered Insert text is flushed once first.
+Initial invalid configuration passed to `initHelixMode()` throws.
+
+Insert prefixes wait up to `chordTimeoutMs` (500 ms by default). A timeout or
+unmatched suffix flushes buffered text once, and an unmatched suffix is processed
+normally. Composition start flushes the prefix before IME input begins.
+Normal/Select prefixes wait for another key or cancellation without a timeout.
 
 Three values have different purposes:
 
@@ -36,7 +44,10 @@ Three values have different purposes:
 
 Keys in Normal/Select that have no editing command still follow the binding's
 modal input policy. `null` does not mean `pass_through`. Hosts should use an
-explicit pass-through rule to preserve their shortcuts.
+explicit pass-through rule to preserve their shortcuts. Escape remains reserved
+for mode exit and cancellation in the Monaco binding. Pass-through applies to
+native events; logical input from `feedKeys()` and macros does not synthesize
+host keyboard events.
 
 ## Key notation
 
@@ -61,8 +72,11 @@ bindings matching their normalized input.
 Macro bindings start with `@`. `@miw` replays `m`, `i`, `w`; named and modified
 keys are enclosed in angle brackets, such as `@ihello<esc>` or `@x<A-d>`.
 Write literal `<` as `<lt>`. `decodeKeys()` and `encodeKeys()` expose the same
-notation. A macro or pass-through binding must stand alone rather than appear
-inside a command array. Colon commands are delegated to `onCommand`.
+notation. `decodeKeys()` and `binding.feedKeys()` accept the macro body without
+the leading `@`, for example `decodeKeys('miw<A-x>')`. A macro or pass-through
+binding must stand alone rather than appear inside a command array. Colon
+commands use `onCommand` when supplied, otherwise `host.executeCommand`.
+Numeric colon commands perform the binding's built-in line navigation.
 
 ## TOML import
 
@@ -83,9 +97,9 @@ Only `[keys.normal]`, `[keys.insert]`, and `[keys.select]` are imported. Other
 sections, such as `theme` and `[editor]`, produce warnings and are ignored.
 Unknown command IDs produce errors when `commands` is supplied. Static command
 names, colon commands, command arrays, nested tables, and standalone `@` macros
-are supported. Helix commands requiring a shell, filesystem, tree-sitter, or a
-workbench still require corresponding host capabilities. Importing a file does
-not add those capabilities.
+are supported. Shell, filesystem, and workbench commands require corresponding
+host capabilities; syntax commands require a configured syntax provider.
+Importing a file only changes bindings.
 
 TOML has no `null`; use JavaScript overrides for explicit deletion. Use `no_op`
 to disable a binding in TOML. Parse errors include the parser's source location;

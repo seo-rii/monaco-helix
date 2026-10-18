@@ -16,15 +16,21 @@ under the MIT License. See [third-party notices](THIRD_PARTY_NOTICES.md) and the
 
 - Selection-first editing with Normal, Insert, and Select modes.
 - Motions, counts, character finds, text objects, and multiple selections.
-- Delete, change, yank, paste, registers, search, and regex selection prompts.
+- Delete, change, yank, paste, registers, surrounds, and selection merging.
+- Configurable mode keymaps, nested prefixes, command sequences, and TOML imports.
+- Worker-based regex search with live previews, history, and cancellation.
+- Macro recording and playback, including committed text and prompt responses.
+- Jump history and host adapters for file, buffer, symbol, and workbench commands.
+- Optional Tree-sitter Worker for Python, C++, and TypeScript syntax objects.
 - Unicode grapheme-aware movement and selection helpers.
 - Undo/redo, repeat insertion, and read-only editor support.
 - Optional mode status element, built-in prompts, mode events, and host commands.
 - Disposal and model lifecycle handling for applications that switch editors.
 
-This is a subset of Helix behavior. It does not run Helix, load its configuration
-or plugins, or provide tree-sitter text objects, shell pipelines, macros, or
-window management. See the [supported keymap](docs/keymap.md).
+This is a browser implementation of a subset of Helix behavior. File access,
+saving, workbench commands, and editor layouts belong to the host application.
+Helix themes, plugins, shell pipelines, and terminal behavior are outside this
+package. See the [supported keymap](docs/keymap.md).
 
 ## Install
 
@@ -109,12 +115,26 @@ The package exports the `HelixBinding`, `HelixOptions`, and `HelixMode` types.
 | `options.onModeChange` | Callback receiving the initial `HelixMode`, later changes, and model resets |
 | `options.onCommand` | Host command callback: `(command: string) => void \| Promise<void>` |
 | `options.onError` | Error callback: `(error: Error) => void` |
+| `options.shouldHandleKey` | Return `false` to preserve an application shortcut |
+| `options.clipboard` | Supply an alternative asynchronous clipboard adapter |
+| `options.keymap` | Override bindings in Normal, Insert, and Select modes |
+| `options.chordTimeoutMs` | Flush an incomplete Insert shortcut after this delay (default 500 ms) |
+| `options.search` | Configure Worker searches, limits, and time budgets |
+| `options.host` | Supply file, buffer, symbol, location, and application command capabilities |
+| `options.navigation` | Bound jump history and picker result counts |
+| `options.syntaxProvider` | Supply optional syntax objects and structured navigation |
 
 The returned handle exposes:
 
-| Method | Description |
+| Member | Description |
 | --- | --- |
 | `getMode()` | Read the current mode |
+| `execute(command, args?)` | Run a registered command and await completion |
+| `listCommands()` | Discover supported command IDs and descriptions |
+| `feedKeys(keys)` | Play logical Helix key notation through the active keymap |
+| `setKeymap(keymap)` | Atomically replace user overrides; returns diagnostics |
+| `cancel()` | Cancel pending work, prefixes, and prompts |
+| `macros` | Record, inspect, import, and replay macros through the binding's `MacroEngine` |
 | `onDidChangeMode(listener)` | Subscribe to future mode notifications; returns a disposable subscription |
 | `dispose()` | Remove the extension's listeners, decorations, and UI |
 
@@ -122,16 +142,27 @@ Numeric colon commands such as `:42` go to that line. Other colon commands are
 passed to `onCommand` without the leading colon for your application to handle.
 Saving, closing files, and buffer switching depend on your host application.
 Monaco language-service commands depend on providers registered by that
-application. Clipboard operations require the browser's clipboard API and
-permission.
+application. Clipboard operations use the supplied adapter or the browser's
+clipboard API.
 
-Registers and the current search pattern belong to each binding, so separate
-editors do not share them. They remain available when that editor changes
-models; editing mode and pending input reset for the new model.
+Registers, completed macros, search history, and jump history belong to each
+binding, so separate editors do not share them. They remain available when that
+editor changes models; editing mode, unfinished recording, and pending work
+reset for the new model.
 
 Insert mode uses Monaco's normal input, completion, and composition handling.
 Normal and Select modes consume ordinary text keys to prevent accidental
 insertion. Browser and operating-system shortcuts can still take precedence.
+
+Read the feature guides for configuration, integration, and limits:
+
+- [Commands and asynchronous execution](docs/commands.md)
+- [Selection editing and surrounds](docs/editing.md)
+- [Custom keymaps and TOML](docs/keymaps.md)
+- [Search, previews, and regex limits](docs/search.md)
+- [Macro recording and playback](docs/macros.md)
+- [Navigation and host capabilities](docs/navigation.md)
+- [Optional syntax objects and Tree-sitter assets](docs/syntax.md)
 
 ## Development
 

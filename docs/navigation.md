@@ -20,7 +20,7 @@ replaces the forward branch. `snapshot()` returns independent copies.
 `back(openLocation)` and `forward(openLocation)` update the history cursor only
 after the host accepts the destination. `navigate(location, openLocation)` adds a
 new accepted destination; record its source before calling it. All three return
-`Promise<boolean>` and accept an optional final `AbortSignal`.
+`Promise<boolean>` and accept an optional `AbortSignal`.
 
 Use `updateCurrent(location)` before traversal when ordinary cursor motion has
 changed the current entry. It refreshes the position without dropping forward
@@ -68,6 +68,8 @@ return its current location, or return `false`. Use the version as a hint and
 validate every offset against the actual model before applying it. Saving or
 closing decisions, including unsaved-change prompts, belong to the host.
 Read-only navigation is permitted; mutating commands must respect host policy.
+Snapshots retain offsets rather than rebasing through intervening edits; the
+host may return a corrected location when clamping alone would be insufficient.
 
 ## Request lifetime
 
@@ -91,6 +93,28 @@ Escape cancels an interactive picker with `AbortError`. Unavailable selected
 destinations reject as failures. Both stop any queued macro or keymap-array edits
 so they cannot run against the selection that preceded the picker.
 
+| Command | Default key |
+| --- | --- |
+| `jump_backward` | `Ctrl-o` |
+| `jump_forward` | `Ctrl-i` |
+| `file_picker` | `Space f` |
+| `buffer_picker` | `Space b` |
+| `symbol_picker` | `Space s` |
+| `host_command` | `:` prompt; arguments contain `command` |
+
+These commands also work through `binding.execute(id, args?)`. A public
+navigation call resolves after an intentional model change has completed.
+Keyboard commands and macros still cancel their old model's pending work when
+the model changes.
+
+The existing `onCommand` callback takes priority for application commands,
+including `binding.execute('host_command', { command: 'write' })`. When it is
+absent, `host.executeCommand` handles the command with an abortable context.
+The host implements aliases such as `w`/`write` and owns save/close confirmation.
+Numeric colon commands such as `:42` go to a local line and record a jump.
+Legacy `onCommand` has no cancellation parameter; prefer the host capability
+when asynchronous external work needs an `AbortSignal`.
+
 Picker macro responses store `{ query, selectedId }` as their prompt value.
 Replay queries the host again and requires that exact ID in the current result;
 it rejects missing targets instead of silently choosing another entry. Cross-model
@@ -99,8 +123,9 @@ for reliable same-model symbol and workbench command replay.
 
 Jump history belongs to the binding and survives model changes. Ordinary cursor
 motion refreshes the current position when traveling without creating a new
-jump or losing forward entries. Explicit large local jumps and accepted searches
-can record their source/destination through the controller bridge. Locations in
+jump or losing forward entries. File/line jumps and accepted searches record
+their source/destination through the controller bridge. A search preview records
+nothing until submission; Escape restores its original position. Locations in
 the active model work without a host opener, with offsets clamped to the current
 document and expanded to complete graphemes. Host workbench commands execute
 only through the supplied capability.

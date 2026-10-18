@@ -16,8 +16,11 @@ keyboard workflows.
 Each binding exposes `binding.macros`, an independent `MacroEngine` with completed
 registers that survive Monaco model changes. A model switch cancels playback and
 discards an unfinished recording. Disposing the binding releases its registers.
-Use `binding.cancel()` or `binding.macros.cancel()` to stop playback; native editor
-input, Escape, and enabling read-only mode also cancel active playback.
+Use `binding.cancel()` to cancel playback together with pending editor commands
+and prompts, or `binding.macros.cancel()` to abort the macro engine's playback.
+Native keys handled by the binding, Insert input, Escape, and enabling read-only
+mode also cancel active playback. Shortcuts delegated by `shouldHandleKey` remain
+under the host's control.
 
 ```ts
 binding.macros.set('a', [
@@ -34,8 +37,11 @@ The binding records ordinary Insert input and committed composition text, rather
 than duplicating both printable key presses and their resulting text. Insert
 movement, deletion, tab and newline commands retain their key events. Playing a
 register during recording records the invocation once, without expanding its
-generated events. Prompt responses are structured events, so a key-only stream
-that opens a prompt cannot silently continue editing the old selection.
+generated events. Recording observes handled native keys and committed textarea
+input. For programmatic workflows or application side effects, record explicit
+`MacroEvent` data through the engine. Prompt responses are structured events, so
+a key-only stream that opens a prompt cannot silently continue editing the old
+selection.
 
 The automated Chromium tests cover native typing, Unicode insertion, and the
 composition event protocol. Real operating-system IME behavior still depends on
@@ -72,6 +78,8 @@ continues to mean the last insertion; macro repetition is controlled by `q`.
 through an injected function and never dispatches synthetic browser input:
 
 ```ts
+import { MacroEngine } from 'monaco-helix/macros';
+
 const macros = new MacroEngine({
   async execute(event, signal, context) {
     if (event.type === 'key') await host.feedKey(event.key, signal, context);
@@ -104,23 +112,25 @@ list rather than silently converted to a purported Helix-compatible string.
 
 An executor can await `context.play(register, count)` when a replayed key resolves
 to another macro, or `context.playKeys(keys, count)` for an inline key stream.
-The binding uses this shared context for `@...` keymap macros too. Explicit `{ type: 'replay', register: 'b', count: 2 }` events do
-the same thing. Sibling nested requests execute in order, and the engine waits
-for them even if the executor forgets to return the child promise. Calling the
+The binding uses this shared context for `@...` keymap macros too. Explicit
+`{ type: 'replay', register: 'b', count: 2 }` events do the same thing. Sibling
+nested requests execute in order, and the engine waits for them even if the
+executor forgets to return the child promise. Calling the
 top-level `play()` while another playback is active reports `busy`.
 
 The defaults are 100,000 total events, 32 nested macro calls, and a browser
 yield every 128 events. All nested calls and repetition counts share the event
-budget. Counts must be integers between 0 and 10,000. Direct and indirect register
-or inline-key recursion is rejected. `playKeys(keys, count, options)` provides the
+budget. Standalone engine counts must be integers between 0 and 10,000; the
+binding's `execute('replay_macro', args)` normalizes counts to 1–10,000. Direct and
+indirect register or inline-key recursion is rejected. `playKeys(keys, count, options)` provides the
 same limits for standalone inline playback. Limits and the yield function are
 configurable when constructing a standalone `MacroEngine`; the Monaco binding
 uses the defaults.
 
-Use `cancel()` or an external `AbortSignal` to interrupt replay. Cancellation
-rejects the playback promise with an `AbortError` whose code is `cancelled`.
-Executor errors reject that promise and invalidate child work. A failed playback
-clears its playing state so another macro can run. `dispose()` cancels playback,
+Use `cancel()` or an external `AbortSignal` to interrupt replay. Engine-generated
+cancellation rejects the playback promise with an `AbortError` whose code is
+`cancelled`. Executor errors are propagated unchanged and invalidate child work.
+A failed playback clears its playing state so another macro can run. `dispose()` cancels playback,
 discards recording, and releases stored registers. Host lifecycle handlers should
 cancel before switching models or disposing the editor.
 

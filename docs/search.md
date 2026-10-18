@@ -17,6 +17,9 @@ true), `maxMatches` (default 1000, maximum 10000), `maxDocumentLength` (default
 2000000 UTF-16 units, maximum 10000000), and `maxPatternLength` (default 2000,
 maximum 10000). Exceeding document/pattern limits throws `RangeError`; reaching
 the result limit sets `truncated` when additional matches exist.
+Normal search announces capped results with a `+` count and cycles through that
+bounded result set; increase `maxMatches` when a document needs more results.
+Selection-regex commands reject a truncated result set before a following edit.
 
 Optional `ranges` runs the pattern independently against selected substrings,
 preserving input selection order and returning an additional `groups` array.
@@ -92,3 +95,6 @@ previews. Prefix key hints appear in a labeled region while a prefix is pending.
 timeout/factory). Search state and submitted-pattern history belong to a binding
 and can survive model changes. Selection-regex operations reject truncated
 results rather than silently returning an incomplete set to a later edit.
+Accepted `/`/`?` searches and repeated `n`/`N` searches record jump history.
+Live previews leave history untouched, and submitting after a preview retains
+the cursor position from before opening the prompt as the jump's source.
