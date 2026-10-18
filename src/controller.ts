@@ -58,6 +58,9 @@ export class HelixController implements monaco.IDisposable {
   private prefixMode: HelixMode | undefined;
   private prefixTimer: ReturnType<typeof setTimeout> | undefined;
   private commandWork: Promise<void> = Promise.resolve();
+  private nativeKeys: string[] = [];
+  private nativeDrain: Promise<void> | undefined;
+  private nativeInputEpoch = 0;
   private continuation: { commands: string[]; count: number; signal?: AbortSignal } | undefined;
   private macroContext: MacroExecutionContext | undefined;
   private macroExecutor: MacroOptions["execute"];
@@ -118,6 +121,7 @@ export class HelixController implements monaco.IDisposable {
       selectMode: () => this.mode === "select",
       getPattern: () => this.session.searchPattern,
       setPattern: pattern => { this.session.searchPattern = pattern; },
+      run: operation => this.dispatcher.run(context => operation(context.signal), this.macroContext?.signal),
     }, options.search ?? {}, session.searchHistory);
     this.macroExecutor = (event, signal, context) => this.executeMacroEvent(event, signal, context);
     this.macroStatus = state => {
@@ -165,21 +169,18 @@ export class HelixController implements monaco.IDisposable {
           const token = keyFromEvent(event.browserEvent);
           if (!token) return;
           if (this.session.macros.isPlaying) this.cancel();
-          const previousMode = this.mode;
-          const prefix = [...this.keyPrefix];
-          const binding = this.keymap.lookup(this.mode, [...prefix, token]);
-          const control = binding.kind === "commands" && binding.commands.includes("record_macro");
-          // Record q before it starts playback, which suppresses generated
-          // events. Prefix/count/register keys retain their remapping semantics.
-          const recorded = !control && previousMode !== "insert" && this.session.macros.isRecording;
-          if (recorded) this.session.macros.record({ type: "key", key: token });
-          const handled = this.routeKey(token, event.browserEvent);
-          if (!recorded && !control && this.session.macros.isRecording) {
-            if (token === "esc" || token === "C-[") this.session.macros.record({ type: "key", key: token });
-            else if (handled && binding.kind !== "pending" && !(binding.kind === "unbound" && !binding.explicit && prefix.length)) {
-              for (const key of [...prefix, token]) this.session.macros.record({ type: "key", key });
-            } else if (!handled && this.nativeInsertCommand(token)) this.session.macros.record({ type: "key", key: token });
+          const escape = token === "esc" || token === "C-[";
+          const binding = this.keymap.lookup(this.mode, [...this.keyPrefix, token]);
+          const interrupt = escape || (!this.nativeDrain && !this.nativeKeys.length && binding.kind === "commands"
+            && ["normal_mode", "select_mode", "insert_mode", "append_mode", "insert_at_line_start", "insert_at_line_end", "open_below", "open_above"].includes(binding.commands[0]));
+          if (interrupt) this.clearNativeInput();
+          else if (binding.kind !== "pass" && (this.nativeDrain || this.nativeKeys.length || (this.mode !== "insert" && this.dispatcher.isBusy))) {
+            this.enqueueNativeKey(token);
+            event.preventDefault();
+            event.stopPropagation();
+            return;
           }
+          const handled = this.routeNativeKey(token, event.browserEvent);
           if (!handled) return;
         } catch (error) { this.ui.error(error); }
         event.preventDefault();
@@ -577,13 +578,13 @@ export class HelixController implements monaco.IDisposable {
     return result;
   }
   /** Feed logical Helix tokens, using Monaco's supported typing commands in Insert. */
-  async feedKey(key: string, signal?: AbortSignal): Promise<void> {
+  async feedKey(key: string, signal?: AbortSignal, native = false): Promise<void> {
     if (!this.alive || signal?.aborted) throw new DOMException("Key input cancelled", "AbortError");
     const token = normalizeKey(key);
     if (this.ui.promptActive?.()) throw new Error("A macro prompt response is required before more keys");
     const previous = this.commandWork;
-    const handled = this.routeKey(token, undefined, signal);
-    if (!handled && this.mode === "insert") this.insertUnbound(token, true);
+    const handled = native ? this.routeNativeKey(token) : this.routeKey(token, undefined, signal);
+    if (!handled && this.mode === "insert") this.insertUnbound(token, !native || !this.nativeInsertCommand(token));
     if (this.commandWork !== previous) await this.commandWork;
     if (!this.ui.promptActive?.()) await this.dispatcher.idle();
     if (!this.alive || signal?.aborted) throw new DOMException("Key input cancelled", "AbortError");
@@ -606,6 +607,7 @@ export class HelixController implements monaco.IDisposable {
     });
   }
   cancel(): void {
+    this.clearNativeInput();
     this.revision++;
     this.clearKeyPrefix(false);
     this.continuation = undefined;
@@ -619,6 +621,65 @@ export class HelixController implements monaco.IDisposable {
     this.pending = this.count = "";
     this.status();
   }
+  private routeNativeKey(token: string, event?: KeyboardEvent): boolean {
+    const previousMode = this.mode;
+    const prefix = [...this.keyPrefix];
+    const binding = this.keymap.lookup(this.mode, [...prefix, token]);
+    const control = binding.kind === "commands" && binding.commands.includes("record_macro");
+    // Record q before it starts playback, which suppresses generated
+    // events. Prefix/count/register keys retain their remapping semantics.
+    const recorded = !control && previousMode !== "insert" && this.session.macros.isRecording;
+    if (recorded) this.session.macros.record({ type: "key", key: token });
+    const handled = this.routeKey(token, event);
+    if (!recorded && !control && this.session.macros.isRecording) {
+      if (token === "esc" || token === "C-[") this.session.macros.record({ type: "key", key: token });
+      else if (handled && binding.kind !== "pending" && !(binding.kind === "unbound" && !binding.explicit && prefix.length)) {
+        for (const key of [...prefix, token]) this.session.macros.record({ type: "key", key });
+      } else if (!handled && this.nativeInsertCommand(token)) this.session.macros.record({ type: "key", key: token });
+    }
+    return handled;
+  }
+
+  private clearNativeInput(): void {
+    this.nativeInputEpoch++;
+    this.nativeKeys = [];
+  }
+
+  private enqueueNativeKey(token?: string): void {
+    if (token !== undefined) {
+      if (this.nativeKeys.length >= 4096) {
+        this.cancel();
+        this.ui.error(new Error("Queued input exceeds 4096 keys"));
+        return;
+      }
+      this.nativeKeys.push(token);
+    }
+    if (this.nativeDrain || !this.nativeKeys.length) return;
+    const epoch = this.nativeInputEpoch;
+    let replaying = false;
+    const work = (async () => {
+      // Interpret buffered tokens only after the preceding selection commits;
+      // c can then change the mode before its following text is interpreted.
+      await this.dispatcher.idle();
+      replaying = true;
+      while (this.nativeKeys.length) {
+        if (!this.alive || epoch !== this.nativeInputEpoch) throw new DOMException("Queued input cancelled", "AbortError");
+        await this.feedKey(this.nativeKeys.shift()!, undefined, true);
+      }
+    })();
+    this.nativeDrain = work;
+    void work.catch(error => {
+      if (epoch === this.nativeInputEpoch) this.clearNativeInput();
+      // The original operation reports its own failure; direct replay errors
+      // such as a recording limit still need the normal UI error boundary.
+      if (replaying && this.alive && !isCancellation(error)) this.ui.error(error);
+    }).finally(() => {
+      if (this.nativeDrain !== work) return;
+      this.nativeDrain = undefined;
+      if (this.alive && this.nativeKeys.length) this.enqueueNativeKey();
+    });
+  }
+
   private dispatch(command: string, args: CommandArguments = {}): void {
     this.commandWork = this.execute(command, args);
     void this.commandWork.catch(error => { if (this.alive && !isCancellation(error)) this.ui.error(error); });
@@ -819,7 +880,7 @@ export class HelixController implements monaco.IDisposable {
     const count = Math.max(1, Number(this.count) || 1);
     this.count = "";
     if (match.kind === "commands") {
-      if (event && ["normal_mode", "select_mode", "insert_mode", "append_mode", "insert_at_line_start", "insert_at_line_end", "open_below", "open_above", "change_selection", "change_selection_noyank"].includes(match.commands[0])) {
+      if (event && ["normal_mode", "select_mode", "insert_mode", "append_mode", "insert_at_line_start", "insert_at_line_end", "open_below", "open_above"].includes(match.commands[0])) {
         this.revision++;
         this.dispatcher.cancel();
       }
@@ -1144,7 +1205,7 @@ export class HelixController implements monaco.IDisposable {
       return true;
     }
     if (this.mode === "insert") return false;
-    if (!this.pending && !event.ctrlKey && !event.altKey && ["i", "a", "I", "A", "o", "O", "c", "v"].includes(key)) {
+    if (!this.pending && !event.ctrlKey && !event.altKey && ["i", "a", "I", "A", "o", "O", "v"].includes(key)) {
       this.revision++;
       this.dispatcher.cancel();
     }
@@ -1301,6 +1362,7 @@ export class HelixController implements monaco.IDisposable {
     if (this.alive && this.mode === "insert") this.editor.pushUndoStop();
     const ranges = restoreEditor && this.alive && this.mode !== "insert" ? this.ranges() : undefined;
     this.disposed = true;
+    this.clearNativeInput();
     this.session.macros.cancel("model detached");
     this.session.macros.discard();
     if (this.session.macroTarget.execute === this.macroExecutor) this.session.macroTarget.execute = undefined;

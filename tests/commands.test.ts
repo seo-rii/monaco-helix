@@ -2,6 +2,43 @@ import { describe, expect, it } from "vitest";
 import { CommandDispatcher } from "../src/commands.js";
 
 describe("command execution", () => {
+  it("orders accepted prompt operations with registered edits", async () => {
+    const runner = new CommandDispatcher(() => true, () => false);
+    const events: string[] = [];
+    let finish!: () => void;
+    const selected = runner.run(() => new Promise<void>(resolve => {
+      finish = () => { events.push("selected"); resolve(); };
+    }));
+    runner.register({ id: "edit", description: "edit" }, () => { events.push("edited"); });
+    const edited = runner.execute("edit");
+    expect(runner.isBusy).toBe(true);
+    expect(events).toEqual([]);
+    finish();
+    await Promise.all([selected, edited]);
+    expect(runner.isBusy).toBe(false);
+    expect(events).toEqual(["selected", "edited"]);
+  });
+  it("discards edits after an ordered prompt operation fails or is cancelled", async () => {
+    const runner = new CommandDispatcher(() => true, () => false);
+    let edits = 0;
+    runner.register({ id: "edit", description: "edit" }, () => { edits++; });
+    const failed = runner.run(async () => { throw new Error("Search failed"); });
+    const stale = runner.execute("edit");
+    await expect(failed).rejects.toThrow("Search failed");
+    await expect(stale).rejects.toHaveProperty("name", "AbortError");
+    let operationSignal!: AbortSignal;
+    const cancelled = runner.run(context => {
+      operationSignal = context.signal;
+      return new Promise<void>(() => {});
+    });
+    const queued = runner.execute("edit");
+    runner.cancel();
+    await expect(cancelled).rejects.toHaveProperty("name", "AbortError");
+    await expect(queued).rejects.toHaveProperty("name", "AbortError");
+    expect(operationSignal.aborted).toBe(true);
+    await runner.execute("edit");
+    expect(edits).toBe(1);
+  });
   it("runs synchronous edits immediately and rejects unknown/read-only commands", async () => {
     let changed = 0;
     let readOnly = false;

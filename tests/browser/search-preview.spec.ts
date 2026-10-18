@@ -150,3 +150,100 @@ test('removes matching selections through the inverse regex prompt', async ({ pa
   await expect.poll(() => selected(page)).toBe('bar');
   expect(await page.evaluate(() => window.editor.getSelections()!.length)).toBe(1);
 });
+
+async function delayedSearch(page: Page) {
+  await page.evaluate(async () => {
+    const { findSearchMatches } = await import('/src/search.ts');
+    window.delayedSearchWorkers = [];
+    window.delayedSearchHostKeys = 0;
+    const source = `const search = (${findSearchMatches.toString()});let request;
+      self.onmessage = ({data}) => {
+        if (Array.isArray(data)) { request = data; return; }
+        if (data === 'reject') { self.postMessage({error:{name:'Error',message:'Delayed search failed'}}); return; }
+        if (data === 'resolve') {
+          try { self.postMessage({result:search(...request)}); }
+          catch(error) { self.postMessage({error:{name:error.name,message:error.message}}); }
+        }
+      };`;
+    window.helix = window.initHelixMode(window.editor, document.getElementById('status')!, {
+      keymap: { normal: { F9: 'pass_through' } },
+      search: {
+        timeoutMs: 30_000,
+        workerFactory() {
+          const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+          const worker = new Worker(url);
+          const terminate = worker.terminate.bind(worker);
+          worker.terminate = () => { terminate(); URL.revokeObjectURL(url); };
+          window.delayedSearchWorkers.push(worker);
+          return worker;
+        },
+      },
+      onError(error) { window.testState.errors.push(error.message); },
+    });
+    window.editor.addAction({
+      id: 'test.delayed-search.host', label: 'Host F9', keybindings: [window.monaco.KeyCode.F9],
+      run() { window.delayedSearchHostKeys++; },
+    });
+    window.editor.focus();
+  });
+  await page.keyboard.type('/');
+  const input = page.getByRole('textbox', { name: 'Helix /', exact: true });
+  await input.fill('beta');
+  await input.press('Enter');
+  await expect(input).toHaveCount(0);
+  await page.waitForFunction(() => window.delayedSearchWorkers.length > 0);
+}
+
+declare global {
+  interface Window { delayedSearchWorkers: Worker[]; delayedSearchHostKeys: number }
+}
+
+test('queues native deletion after an accepted search until its worker selects the intended match', async ({ page }) => {
+  await setDocument(page, 'alpha beta');
+  await delayedSearch(page);
+  await page.keyboard.type('d');
+  await page.keyboard.press('F9');
+  expect(await page.evaluate(() => window.delayedSearchHostKeys)).toBe(1);
+  expect(await page.evaluate(() => window.editor.getValue())).toBe('alpha beta');
+  await page.evaluate(() => window.delayedSearchWorkers.at(-1)!.postMessage('resolve'));
+  await expect.poll(() => page.evaluate(() => window.editor.getValue())).toBe('alpha ');
+  expect(await page.evaluate(() => window.testState.errors)).toEqual([]);
+});
+
+test('queues native change and following text behind an accepted search', async ({ page }) => {
+  await setDocument(page, 'alpha beta');
+  await delayedSearch(page);
+  await page.evaluate(() => window.helix.macros.start('a'));
+  await page.keyboard.type('chello');
+  expect(await page.evaluate(() => window.editor.getValue())).toBe('alpha beta');
+  expect(await page.evaluate(() => window.helix.getMode())).toBe('normal');
+  await page.evaluate(() => window.delayedSearchWorkers.at(-1)!.postMessage('resolve'));
+  await expect.poll(() => page.evaluate(() => window.helix.getMode())).toBe('insert');
+  await expect.poll(() => page.evaluate(() => window.editor.getValue())).toBe('alpha hello');
+  const recording = await page.evaluate(() => window.helix.macros.stop());
+  expect(recording.filter(event => event.type === 'key').map(event => event.key)).toEqual(['c']);
+  expect(recording.filter(event => event.type === 'text').map(event => event.text).join('')).toBe('hello');
+});
+
+test('discards native deletion queued after a rejected accepted search', async ({ page }) => {
+  await setDocument(page, 'alpha beta');
+  await delayedSearch(page);
+  await page.keyboard.type('dchello');
+  expect(await page.evaluate(() => window.editor.getValue())).toBe('alpha beta');
+  await page.evaluate(() => window.delayedSearchWorkers.at(-1)!.postMessage('reject'));
+  await expect.poll(() => page.evaluate(() => window.testState.errors)).toContain('Delayed search failed');
+  expect(await page.evaluate(() => window.editor.getValue())).toBe('alpha beta');
+});
+
+test('Escape cancels an accepted search and its queued native deletion', async ({ page }) => {
+  await setDocument(page, 'alpha beta');
+  await delayedSearch(page);
+  await page.keyboard.type('dchello');
+  expect(await page.evaluate(() => window.editor.getValue())).toBe('alpha beta');
+  await page.keyboard.press('Escape');
+  await page.evaluate(() => window.delayedSearchWorkers.at(-1)!.postMessage('resolve'));
+  expect(await page.evaluate(() => window.editor.getValue())).toBe('alpha beta');
+  await page.keyboard.type('l');
+  expect(await selected(page)).toBe('l');
+  expect(await page.evaluate(() => window.testState.errors)).toEqual([]);
+});

@@ -14,7 +14,7 @@ export function isCancellation(error: unknown): boolean { return error instanceo
 /** Executes synchronous edits immediately, and serializes asynchronous selections and edits. */
 export class CommandDispatcher {
   private handlers = new Map<string, { info: CommandInfo; run: CommandHandler }>();
-  private pending: Array<{ id: string; args: CommandArguments; signal?: AbortSignal; resolve(): void; reject(error: unknown): void }> = [];
+  private pending: Array<{ id?: string; args: CommandArguments; operation?: (context: CommandContext) => void | Promise<void>; signal?: AbortSignal; resolve(): void; reject(error: unknown): void }> = [];
   private active?: AbortController;
   private idleWaiters: Array<{resolve(): void; reject(error: unknown): void}> = [];
   private disposed = false;
@@ -24,14 +24,22 @@ export class CommandDispatcher {
     this.handlers.set(info.id, { info: { ...info }, run });
   }
   list(): CommandInfo[] { return [...this.handlers.values()].map(item => ({ ...item.info })); }
+  get isBusy(): boolean { return !!this.active || this.pending.length > 0; }
   idle(): Promise<void> {
     if (!this.active && !this.pending.length) return Promise.resolve();
     return new Promise((resolve, reject) => this.idleWaiters.push({ resolve, reject }));
   }
   execute(id: string, args: CommandArguments = {}, signal?: AbortSignal): Promise<void> {
+    return this.enqueue({ id, args, signal });
+  }
+  /** Order a model-bound operation with registered commands, including failure cancellation. */
+  run(operation: (context: CommandContext) => void | Promise<void>, signal?: AbortSignal): Promise<void> {
+    return this.enqueue({ operation, args: {}, signal });
+  }
+  private enqueue(task: { id?: string; args: CommandArguments; operation?: (context: CommandContext) => void | Promise<void>; signal?: AbortSignal }): Promise<void> {
     return new Promise((resolve, reject) => {
-      if (this.disposed || signal?.aborted) { reject(cancellation()); return; }
-      this.pending.push({ id, args, signal, resolve, reject });
+      if (this.disposed || task.signal?.aborted) { reject(cancellation()); return; }
+      this.pending.push({ ...task, resolve, reject });
       this.drain();
     });
   }
@@ -63,10 +71,11 @@ export class CommandDispatcher {
     };
     try {
       assertCurrent();
-      const command = this.handlers.get(job.id);
-      if (!command) throw new Error(`Unknown command: ${job.id}`);
-      if (command.info.mutates && this.readOnly()) throw new Error("Read-only editor");
-      const result = command.run(job.args, { signal: controller.signal, assertCurrent });
+      const command = job.id === undefined ? undefined : this.handlers.get(job.id);
+      if (!job.operation && !command) throw new Error(`Unknown command: ${job.id}`);
+      if (command?.info.mutates && this.readOnly()) throw new Error("Read-only editor");
+      const context = { signal: controller.signal, assertCurrent };
+      const result = job.operation ? job.operation(context) : command!.run(job.args, context);
       if (!result || typeof result.then !== "function") { finish(); return; }
       let onAbort: (() => void) | undefined;
       const cancelled = new Promise<never>((_, reject) => {

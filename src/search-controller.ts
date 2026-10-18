@@ -11,6 +11,7 @@ export interface SearchControllerAccess {
   selectMode(): boolean;
   getPattern(): string;
   setPattern(pattern: string): void;
+  run(operation: (signal: AbortSignal) => Promise<void>): Promise<void>;
 }
 
 export type RegexPromptKind = "s" | "S" | "K" | "remove";
@@ -119,18 +120,20 @@ export function createSearchController(
     ui.prompt(label, async value => {
       session.accept();
       if (preview === session) preview = undefined;
-      const pattern = value || (scoped ? "" : access.getPattern());
-      if (!pattern) { restore(snapshot); return; }
-      try {
-        const result = await matches(snapshot, pattern, scoped);
-        commit(pattern, result);
-      } catch (error) {
-        if (current(snapshot) && !(error instanceof Error && error.name === "AbortError")) {
-          restore(snapshot);
-          ui.notify(error instanceof Error ? error.message : String(error));
+      return access.run(async signal => {
+        const pattern = value || (scoped ? "" : access.getPattern());
+        if (!pattern) { restore(snapshot); return; }
+        try {
+          const result = await matches(snapshot, pattern, scoped, [signal]);
+          commit(pattern, result);
+        } catch (error) {
+          if (current(snapshot) && !(error instanceof Error && error.name === "AbortError")) {
+            restore(snapshot);
+            ui.notify(error instanceof Error ? error.message : String(error));
+          }
+          throw error;
         }
-        throw error;
-      }
+      });
     }, "", {
       history,
       onCancel() { session.cancel(); if (preview === session) preview = undefined; },

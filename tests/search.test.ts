@@ -181,6 +181,7 @@ function searchFixture(maxMatches = 1000) {
     select: next => { ranges = next; revision++; scroll = { scrollTop: 100, scrollLeft: 0 }; },
     alive: () => alive, revision: () => revision, selectMode: () => false,
     getPattern: () => pattern, setPattern: next => { pattern = next; },
+    run: operation => operation(new AbortController().signal),
   }, { workerFactory: threadedWorker, timeoutMs: 1500, maxMatches });
   return {
     controller, ui, get prompt() { return prompt; }, get ranges() { return ranges; }, get scroll() { return scroll; },

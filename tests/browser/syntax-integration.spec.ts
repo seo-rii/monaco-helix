@@ -198,3 +198,18 @@ test("public structured selection commands use provider operations and preserve 
   expect(result.map((value: any) => value.kind)).toEqual(["parent", "child", "next", "nextSibling"]);
   expect(result[2].object).toBe("function");
 });
+
+test("buffers native change and its replacement text until async syntax selection commits", async ({ page }) => {
+  await fakeSyntax(page);
+  await page.keyboard.type("mifchello");
+  await pendingRequest(page);
+  expect(await page.evaluate(() => window.editor.getValue())).toBe("first second third");
+  expect(await page.evaluate(() => window.helix.getMode())).toBe("normal");
+  await page.evaluate(() => {
+    const state = (window as any).syntaxTest;
+    state.resolve({ version: state.requests[0].document.version, selections: [{ anchor: 6, head: 12 }] });
+  });
+  await expect.poll(() => page.evaluate(() => window.editor.getValue())).toBe("first hello third");
+  expect(await page.evaluate(() => window.helix.getMode())).toBe("insert");
+  expect(await page.evaluate(() => window.testState.errors)).toEqual([]);
+});
