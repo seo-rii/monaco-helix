@@ -12,6 +12,7 @@ import {
 import { CommandDispatcher, isCancellation } from "./commands.js";
 import type { CommandArguments, CommandInfo } from "./commands.js";
 import type { HelixOptions, HelixMode, ModalUI } from "./types.js";
+import { surroundEdits, mergeSelections, mergeConsecutiveSelections } from "./editing.js";
 
 interface InsertHistory {
   before: number;
@@ -251,14 +252,14 @@ export class HelixController implements monaco.IDisposable {
     } else perform(this.session.registers.get(register) ?? []);
   }
 
-  private enterInsert(entry: string) {
+  private enterInsert(entry: string, yank = true) {
     if (!this.writable()) return;
     this.editor.pushUndoStop();
     this.insertVersion = this.model.getAlternativeVersionId();
     this.insertSelections = this.ranges();
     this.insertEntry = entry;
     this.setMode("insert");
-    if (entry === "c") { this.yank(); this.replace([""], false); }
+    if (entry === "c") { if (yank) this.yank(); this.replace([""], false); }
     else if (entry === "o" || entry === "O") {
       const seen = new Set<number>();
       const edits = this.ranges().flatMap(range => {
@@ -453,7 +454,7 @@ export class HelixController implements monaco.IDisposable {
           const regex = new RegExp(pattern, "mu");
           const result = this.ranges().filter(range => {
             const [start, end] = selectionBounds(range);
-            return regex.test(this.text.slice(start, end));
+            return regex.test(this.text.slice(start, end)) !== (kind === "Alt-K");
           });
           if (result.length) this.select(result);
           else this.ui.notify("No matches");
@@ -512,6 +513,20 @@ export class HelixController implements monaco.IDisposable {
     for (const [id, action] of Object.entries({ hover: "editor.action.showHover", code_action: "editor.action.quickFix", match_brackets: "editor.action.jumpToBracket", page_up: "cursorPageUp", page_down: "cursorPageDown" }))
       add(id, id.replaceAll("_", " "), () => this.action(action));
     add("no_op", "Do nothing", () => {});
+    add("delete_selection_noyank", "Delete without yanking", () => this.replace([""]), true, ["Alt-d"]);
+    add("change_selection_noyank", "Change without yanking", () => this.enterInsert("c", false), true, ["Alt-c"]);
+    add("surround_delete", "Remove surround", args => this.edit(surroundEdits(this.text, this.ranges(), String(args.character))), true, ["md"]);
+    add("surround_replace", "Replace surround", args => this.edit(surroundEdits(this.text, this.ranges(), String(args.character), String(args.replacement))), true, ["mr"]);
+    add("merge_selections", "Merge selections", () => this.select(mergeSelections(this.ranges())), false, ["Alt-minus"]);
+    add("merge_consecutive_selections", "Merge adjacent selections", () => this.select(mergeConsecutiveSelections(this.ranges())), false, ["Alt-_"]);
+    add("remove_selections", "Remove regex matches", () => this.regexPrompt("Alt-K"), false, ["Alt-K"]);
+    add("copy_selection_on_prev_line", "Add selection above", () => {
+      this.select([...this.ranges(), ...this.ranges().flatMap(range => {
+        const a = this.model.getPositionAt(range.anchor), b = this.model.getPositionAt(range.head);
+        if (a.lineNumber === 1 || b.lineNumber === 1) return [];
+        return [{anchor:this.model.getOffsetAt({lineNumber:a.lineNumber-1,column:a.column}),head:this.model.getOffsetAt({lineNumber:b.lineNumber-1,column:b.column})}];
+      })]);
+    }, false, ["Alt-C"]);
   }
 
   private key(event: KeyboardEvent): boolean {
@@ -547,6 +562,8 @@ export class HelixController implements monaco.IDisposable {
       return key.toLowerCase() !== "s";
     }
     if (event.altKey) {
+      const commands: Record<string,string> = { KeyD:"delete_selection_noyank", KeyC:event.shiftKey?"copy_selection_on_prev_line":"change_selection_noyank", KeyK:"remove_selections", Minus:event.shiftKey?"merge_consecutive_selections":"merge_selections" };
+      if (commands[event.code]) { this.dispatch(commands[event.code]); return true; }
       if (event.code === "Semicolon") this.select(this.ranges().map(range => ({ anchor: range.head, head: range.anchor })));
       else if (event.code === "KeyS") this.select(regexSelections(this.text, this.ranges(), "\\r?\\n", true));
       else if (event.code === "Period" && this.lastFind) this.find(this.lastFind.command, this.lastFind.character, 1);
@@ -569,7 +586,10 @@ export class HelixController implements monaco.IDisposable {
         this.status();
         return true;
       }
-      if (prefix === "m" && (key === "i" || key === "a" || key === "s")) this.pending = "m" + key;
+      if (prefix === "m" && ["i", "a", "s", "d", "r"].includes(key)) this.pending = "m" + key;
+      else if (prefix === "md") this.dispatch("surround_delete", {character:key});
+      else if (prefix === "mr") this.pending = "mr" + key;
+      else if (prefix.startsWith("mr") && prefix.length > 2) this.dispatch("surround_replace", {character:prefix.slice(2),replacement:key});
       else if (prefix === "g") {
         const ids: Record<string,string> = {g:"goto_file_start",e:"goto_last_line",s:"goto_first_nonwhitespace","|":"goto_column",d:"goto_definition",y:"goto_type_definition",r:"goto_reference",i:"goto_implementation",h:"goto_line_start",l:"goto_line_end"};
         if (ids[key]) this.dispatch(ids[key], {count});
