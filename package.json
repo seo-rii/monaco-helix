@@ -4,6 +4,11 @@
   "description": "Selection-first Helix keybindings for the Monaco editor",
   "type": "module",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/",
+    "tag": "latest"
+  },
   "author": "Seohyun Lee <me@seorii.page>",
   "repository": {
     "type": "git",

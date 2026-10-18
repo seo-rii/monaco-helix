@@ -73,6 +73,6 @@ records each shipped binary's byte length and SHA-256 hash.
 
 The distributed assets include `dist/syntax-assets/LICENSES.txt`, containing the
 runtime and prebuilt package's license texts plus the three grammar notices.
-See the [asset copy script](scripts/copy-syntax-assets.mjs) and
+See the [asset copy script](https://github.com/seo-rii/monaco-helix/blob/main/scripts/copy-syntax-assets.mjs) and
 [syntax deployment guide](docs/syntax.md). The textobject queries in this
 package are original implementations of the documented capture contract.

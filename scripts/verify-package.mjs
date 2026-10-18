@@ -1,14 +1,33 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, mkdirSync, writeFileSync, symlinkSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, mkdirSync, writeFileSync, symlinkSync, rmSync, existsSync, realpathSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, dirname, relative, isAbsolute, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 
-const root = process.cwd();
+const root = realpathSync(process.cwd());
+const args = process.argv.slice(2);
+assert(args.length === 0 || (args.length === 2 && args[0] === '--pack-destination' && args[1]),
+  'Usage: node scripts/verify-package.mjs [--pack-destination <directory>]');
+let packDestination;
+if (args.length) {
+  const requested = resolve(args[1]);
+  let ancestor = requested;
+  while (!existsSync(ancestor)) ancestor = dirname(ancestor);
+  packDestination = resolve(realpathSync(ancestor), relative(ancestor, requested));
+  const fromRoot = relative(root, packDestination);
+  assert(fromRoot && (fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)),
+    'The pack destination must be outside the physical repository root');
+  mkdirSync(packDestination, { recursive: true, mode: 0o700 });
+}
 const temporary = mkdtempSync(join(tmpdir(), 'monaco-helix-package-'));
+let artifact;
 try {
-  const [pack] = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', temporary], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+  const [pack] = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', packDestination ?? temporary], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }));
+  artifact = join(packDestination ?? temporary, pack.filename);
+  chmodSync(artifact, 0o600);
+  const integrity = `sha512-${createHash('sha512').update(readFileSync(artifact)).digest('base64')}`;
+  assert.equal(integrity, pack.integrity, 'Packed artifact integrity mismatch');
   const files = new Set(pack.files.map(file => file.path));
   const metadata = JSON.parse(readFileSync('package.json', 'utf8'));
   function targetsOf(entry) {
@@ -36,7 +55,7 @@ try {
   }
   const modules = join(temporary, 'node_modules');
   mkdirSync(modules);
-  execFileSync('tar', ['-xzf', join(temporary, pack.filename), '-C', modules]);
+  execFileSync('tar', ['-xzf', artifact, '-C', modules]);
   const extracted = join(modules, 'package');
   symlinkSync(extracted, join(modules, 'monaco-helix'), 'dir');
   symlinkSync(resolve(root, 'node_modules/monaco-editor'), join(modules, 'monaco-editor'), 'dir');
@@ -122,6 +141,10 @@ try { for (const [languageId, text, expected] of fixtures) {
 `);
   execFileSync(process.execPath, [join(temporary, 'parse.mjs')], { cwd: temporary, stdio: 'pipe' });
   console.log(`Package verified: ${pack.files.length} files, ${pack.size} bytes; exports, optional-free TypeScript consumers, asset hashes/licenses, and extracted WASM parsing passed.`);
+  if (packDestination) console.log(`Verified tarball: ${artifact}\nIntegrity: ${integrity}`);
+} catch (error) {
+  if (packDestination && artifact && existsSync(artifact)) console.error(`Package verification failed; unverified tarball retained for inspection: ${artifact}`);
+  throw error;
 } finally {
   rmSync(temporary, { recursive: true, force: true });
 }

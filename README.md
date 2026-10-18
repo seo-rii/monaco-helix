@@ -34,8 +34,13 @@ package. See the [supported keymap](docs/keymap.md).
 
 ## Install
 
-The initial release is available from GitHub. It is not published to the npm
-registry.
+Install the npm package together with Monaco:
+
+```sh
+npm install monaco-helix monaco-editor@^0.55.1
+```
+
+You can also install the source directly from GitHub:
 
 ```sh
 npm install github:seo-rii/monaco-helix monaco-editor@^0.55.1
