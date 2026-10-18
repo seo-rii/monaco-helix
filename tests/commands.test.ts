@@ -50,4 +50,15 @@ describe("command execution", () => {
     runner.dispose();
     await expect(runner.execute("wait")).rejects.toHaveProperty("name", "AbortError");
   });
+  it("allows a fresh command immediately after cancellation", async () => {
+    const runner = new CommandDispatcher(() => true, () => false);
+    runner.register({ id: "wait", description: "wait" }, () => new Promise<void>(() => {}));
+    let changed = 0;
+    runner.register({ id: "edit", description: "edit" }, () => { changed++; });
+    const old = runner.execute("wait");
+    runner.cancel();
+    await runner.execute("edit");
+    await expect(old).rejects.toHaveProperty("name", "AbortError");
+    expect(changed).toBe(1);
+  });
 });
