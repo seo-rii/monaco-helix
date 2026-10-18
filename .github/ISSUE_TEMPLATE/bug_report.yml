@@ -1,0 +1,31 @@
+name: Bug report
+description: Report unexpected editing or integration behavior.
+title: "[Bug] "
+body:
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Include the document, initial selections, mode, and exact key sequence. A minimal demo is especially useful.
+      placeholder: "Document: hello world\nCursor: line 1, column 1\nKeys: e c ..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+      description: If this differs from Helix, include the Helix version and behavior you compared.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: monaco-helix version or commit, Monaco version, browser, and operating system.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Relevant editor options, console errors, or screenshots.

@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose an editing command or integration improvement.
+title: "[Feature] "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Use case
+      description: What editing or integration task would this help with?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Include example key sequences and expected selections where applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: reference
+    attributes:
+      label: References and alternatives
+      description: Link relevant Helix documentation or describe an alternative approach.

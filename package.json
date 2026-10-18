@@ -1,0 +1,68 @@
+{
+  "name": "monaco-helix",
+  "version": "0.1.0",
+  "description": "Selection-first Helix keybindings for the Monaco editor",
+  "type": "module",
+  "license": "MIT",
+  "author": "Seohyun Lee <me@seorii.page>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/seo-rii/monaco-helix.git"
+  },
+  "homepage": "https://github.com/seo-rii/monaco-helix#readme",
+  "bugs": {
+    "url": "https://github.com/seo-rii/monaco-helix/issues"
+  },
+  "keywords": [
+    "monaco",
+    "monaco-editor",
+    "helix",
+    "keybindings",
+    "modal",
+    "editor"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./style.css": "./dist/styles.css"
+  },
+  "files": [
+    "dist",
+    "src",
+    "docs",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md"
+  ],
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-style.mjs",
+    "prepare": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:browser": "playwright test",
+    "dev": "vite --host 127.0.0.1",
+    "check": "npm run typecheck && npm test && npm run build && npm run test:browser"
+  },
+  "peerDependencies": {
+    "monaco-editor": "^0.55.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "monaco-editor": "0.55.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

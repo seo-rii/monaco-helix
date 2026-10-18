@@ -1,0 +1,31 @@
+.monaco-editor.monaco-helix-command .cursor {
+  visibility: hidden !important;
+}
+.monaco-editor .monaco-helix-cursor {
+  background: var(--vscode-editorCursor-foreground, #a6accd);
+  color: var(--vscode-editor-background, #1e1e1e);
+  outline: 1px solid var(--vscode-editorCursor-foreground, #a6accd);
+}
+.monaco-helix-status {
+  display: flex;
+  align-items: center;
+  gap: 0.65em;
+  padding: 3px 8px;
+  box-sizing: border-box;
+  max-width: 100%;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+  color: var(--vscode-editor-foreground, #ddd);
+  background: var(--vscode-editor-background, #1e1e1e);
+}
+.monaco-helix-status [data-role="mode"] { font-weight: 700; }
+.monaco-helix-status [data-role="message"] { opacity: 0.8; }
+.monaco-helix-status input {
+  width: 20em;
+  max-width: 60vw;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid currentColor;
+  outline: none;
+}

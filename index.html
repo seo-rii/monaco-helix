@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>monaco-helix · Playground</title>
+    <style>
+      :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #151820; color: #dfe3ed; }
+      body { max-width: 1100px; margin: 0 auto; padding: 28px 24px; }
+      header { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+      h1 { margin: 0; font-size: 24px; letter-spacing: -0.8px; }
+      a { color: #a6d0ff; }
+      p { color: #aab3c6; line-height: 1.7; }
+      button { padding: 9px 14px; background: #28354d; color: inherit; border: 1px solid #4d6383; border-radius: 6px; cursor: pointer; }
+      #editor { height: min(65vh, 640px); min-height: 280px; border: 1px solid #363e50; }
+      #status { min-height: 27px; border: 1px solid #363e50; border-top: none; }
+      kbd { background: #262c3b; color: #e4e9f3; padding: 2px 5px; border-radius: 3px; }
+      footer { font-size: 13px; margin-top: 18px; color: #aab3c6; }
+    </style>
+  </head>
+  <body>
+    <header><h1>monaco-helix</h1><button id="toggle" type="button">Disable Helix</button></header>
+    <p>Selection-first editing for Monaco. Try <kbd>e</kbd> then <kbd>c</kbd> to change a word,
+      <kbd>x</kbd> then <kbd>d</kbd> to delete a line, or <kbd>v</kbd> to extend a selection.
+      <kbd>i</kbd> enters Insert; <kbd>Esc</kbd> returns to Normal.</p>
+    <div id="editor" aria-label="Helix playground"></div>
+    <div id="status"></div>
+    <footer><a href="https://github.com/seo-rii/monaco-helix">Source & documentation</a> · MIT ·
+      Adapted from <a href="https://github.com/zixiao-labs/logos">Logos</a>.</footer>
+    <script type="module" src="/example/main.ts"></script>
+  </body>
+</html>
